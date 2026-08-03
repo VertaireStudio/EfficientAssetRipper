@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - UE 5.6–5.9 support. CUE4ParseCLI now targets .NET 10 and bundles
   CUE4Parse 1.2.2.202607; UE 5.7 raised the package `LegacyFileVersion`
   to -9, which every earlier build rejected outright.
+- Dependency-following export — exporting a mesh now also exports its
+  referenced materials, their parent chains, and all referenced
+  textures, so a single-mesh export is immediately processable without
+  hand-exporting `Content/Materials` and `Content/Textures`.
 
 ### Fixed
 - A UE version CUE4Parse doesn't define no longer falls back to 5.4 in

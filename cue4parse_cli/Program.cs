@@ -598,27 +598,12 @@ internal static class Program
             throw;
         }
 
-        // Register .upk files (UE3 packages) in the VFS — CUE4Parse auto-discovers
-        // .uasset/.umap but not .upk, so we manually add them to enable LoadPackage()
-        try
-        {
-            var upkDir = new DirectoryInfo(gameDir);
-            if (upkDir.Exists)
-            {
-                // Files property returns FileProviderDictionary (extends Dictionary<string, GameFile>)
-                // exposed as IReadOnlyDictionary — cast back to mutable to add .upk entries
-                var filesDict = (IDictionary<string, GameFile>)_provider.Files;
-                foreach (var f in upkDir.EnumerateFiles("*.upk", SearchOption.AllDirectories))
-                {
-                    var osFile = new OsGameFile(upkDir, f, "", _provider.Versions);
-                    filesDict[osFile.Path] = osFile;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Respond(new { type = "warning", message = $"UPK registration: {SanitizeMessage(ex.Message)}" });
-        }
+        // .upk files (UE3 packages) need no manual VFS registration: CUE4Parse
+        // 1.2.2.202607's DefaultFileProvider enumerates every file in the game
+        // dir, .upk included (verified against Rocket League — 19579 files,
+        // AkAudio.upk browsable and exportable). The old cast-to-mutable
+        // registration hack stopped compiling against FileProviderDictionary
+        // and only produced a spurious warning per mount.
 
         // Load mappings file if provided. A path that is set but unusable used
         // to be skipped in silence, so a typo looked identical to having no
@@ -1085,6 +1070,7 @@ internal static class Program
         int total = paths.Count, current = 0;
         var succeeded = new List<string>();
         var failed = new List<object>();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var assetPath in paths)
         {
@@ -1094,7 +1080,7 @@ internal static class Program
 
             try
             {
-                var exported = ExportAsset(assetPath, outputDir, formats);
+                var exported = ExportAsset(assetPath, outputDir, formats, visited);
                 if (exported)
                     succeeded.Add(assetPath);
                 else
@@ -1150,6 +1136,7 @@ internal static class Program
         int total = assetPaths.Count, current = 0;
         var succeeded = new List<string>();
         var failed = new List<object>();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         Respond(new { type = "progress", current = 0, total, message = $"Found {total} assets to export" });
 
@@ -1163,7 +1150,7 @@ internal static class Program
 
             try
             {
-                var exported = ExportAsset(assetPath, outputDir, formats);
+                var exported = ExportAsset(assetPath, outputDir, formats, visited);
                 if (exported)
                     succeeded.Add(assetPath);
             }
@@ -1178,7 +1165,18 @@ internal static class Program
     }
 
     // ─── Core export logic ────────────────────────────────────────────
-    private static bool ExportAsset(string gamePath, string outputDir, Dictionary<string, bool> formats)
+
+    // Meshes reference materials in other packages, materials reference parent
+    // materials and textures. Exporting one mesh must pull that whole chain or
+    // the Python scan pipeline finds a props file pointing at assets that were
+    // never extracted. Depth 8 outlasts any real parent chain; the visited set
+    // is the actual cycle guard.
+    private const int MaxDependencyDepth = 8;
+
+    private static readonly Regex _depRefRe = new(@"^(?:Material\w*|Texture2D)'", RegexOptions.Compiled);
+
+    private static bool ExportAsset(string gamePath, string outputDir, Dictionary<string, bool> formats,
+                                    HashSet<string>? visited = null, int depth = 0)
     {
         // Build nested output directory preserving the game path structure.
         // gamePath is parent-supplied — SafeJoin rejects "../" traversal.
@@ -1196,7 +1194,7 @@ internal static class Program
 
         // Strip package extension for CUE4Parse — it uses extensionless game paths
         // NOTE: .upk is NOT stripped because FindGameFile only tries .uasset/.umap
-        // — we registered .upk files with their full path so exact match works
+        // — the provider auto-registers .upk with its full path so exact match works
         var objectPath = gamePath;
         foreach (var ext in new[] { ".uasset", ".umap" })
         {
@@ -1206,6 +1204,13 @@ internal static class Program
                 break;
             }
         }
+
+        // One export per package per command — dependency-following would
+        // otherwise re-export shared materials/textures for every mesh that
+        // references them.
+        visited ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!visited.Add(objectPath))
+            return true;
 
         // Load the package and resolve all exports
         var exports = new List<UObject>();
@@ -1234,6 +1239,7 @@ internal static class Program
         }
 
         bool exported = false;
+        var refPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var obj in exports)
         {
@@ -1280,12 +1286,33 @@ internal static class Program
                 Respond(new { type = "warning", message = $"{obj.Name} ({obj.ExportType}): {SanitizeMessage(ex.Message)}" });
             }
 
-            // Export props for every object regardless of type
-            if (formats.GetValueOrDefault("props", true))
+            // Serialize once — the JSON feeds both the props file and the
+            // dependency walk below.
+            string? propsJson = null;
+            var followRefs = depth < MaxDependencyDepth &&
+                             (obj is UStaticMesh || obj is USkeletalMesh || obj is UMaterialInterface);
+            var wantProps = formats.GetValueOrDefault("props", true);
+            if (followRefs || wantProps)
             {
-                exported |= ExportGenericProps(obj, nestedOutputDir);
+                try { propsJson = RunSerializeOnBoundedThread(() => SerializeUObject(obj), 15_000); }
+                catch (Exception ex)
+                {
+                    Respond(new { type = "warning", message = $"Props serialize failed for {obj.Name}: {SanitizeMessage(ex.Message)}" });
+                }
             }
+
+            // Export props for every object regardless of type
+            if (wantProps)
+            {
+                exported |= ExportGenericProps(obj, nestedOutputDir, propsJson);
+            }
+
+            if (followRefs && propsJson != null)
+                CollectAssetRefs(propsJson, refPaths);
         }
+
+        if (refPaths.Count > 0)
+            ExportDependencies(refPaths, outputDir, formats, visited, depth + 1);
 
         if (!exported && exports.Count > 0)
         {
@@ -1583,13 +1610,11 @@ internal static class Program
         return true;
     }
 
-    private static bool ExportGenericProps(UObject obj, string outputDir)
+    private static bool ExportGenericProps(UObject obj, string outputDir, string? propsJson)
     {
+        if (propsJson == null) return false;
         try
         {
-            var propsJson = RunSerializeOnBoundedThread(() => SerializeUObject(obj), 15_000);
-            if (propsJson == null) return false;
-
             var outPath = SafeJoin(outputDir, $"{obj.Name}.props.txt");
             if (!File.Exists(outPath))
                 File.WriteAllText(outPath, propsJson);
@@ -1599,6 +1624,60 @@ internal static class Program
         {
             Respond(new { type = "warning", message = $"Props export failed for {obj.Name}: {SanitizeMessage(ex.Message)}" });
             return false;
+        }
+    }
+
+    // ─── Dependency-following export ──────────────────────────────────
+
+    /// <summary>
+    /// Pull material and texture object references out of a serialized
+    /// UObject. Matches ObjectName tags like Material'…',
+    /// MaterialInstanceConstant'…', Texture2D'…' anywhere in the JSON tree —
+    /// this covers StaticMaterials/SkeletalMaterials on meshes,
+    /// TextureParameterValues and Parent on material instances, and
+    /// CachedExpressionData.ReferencedTextures on cooked UE5 materials.
+    /// </summary>
+    private static void CollectAssetRefs(string propsJson, HashSet<string> refPaths)
+    {
+        JToken root;
+        try { root = JToken.Parse(propsJson); }
+        catch { return; }
+        if (root is not JContainer container) return;
+
+        foreach (var tok in container.DescendantsAndSelf())
+        {
+            if (tok is not JObject o) continue;
+            var objName = o.Value<string>("ObjectName");
+            var objPath = o.Value<string>("ObjectPath");
+            if (string.IsNullOrEmpty(objName) || string.IsNullOrEmpty(objPath)) continue;
+            if (_depRefRe.IsMatch(objName))
+                refPaths.Add(objPath);
+        }
+    }
+
+    private static void ExportDependencies(HashSet<string> refPaths, string outputDir,
+        Dictionary<string, bool> formats, HashSet<string> visited, int depth)
+    {
+        foreach (var refPath in refPaths)
+        {
+            if (_cts.Token.IsCancellationRequested) break;
+
+            // ObjectPath is "<Pkg>/Path/Name.<exportIndex or SubObject>" —
+            // strip the object part to get the package path CUE4Parse loads.
+            var pkgPath = refPath.TrimStart('/');
+            var slash = pkgPath.LastIndexOf('/');
+            var dot = pkgPath.LastIndexOf('.');
+            if (dot > slash) pkgPath = pkgPath[..dot];
+            if (pkgPath.Length == 0) continue;
+
+            try
+            {
+                ExportAsset(pkgPath + ".uasset", outputDir, formats, visited, depth);
+            }
+            catch (Exception ex)
+            {
+                Respond(new { type = "warning", message = $"Dependency {Path.GetFileName(pkgPath)}: {SanitizeMessage(ex.Message)}" });
+            }
         }
     }
 
