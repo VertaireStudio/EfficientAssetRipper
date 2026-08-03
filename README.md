@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/exterminathan/EfficientAssetRipper?include_prereleases&sort=semver)](https://github.com/exterminathan/EfficientAssetRipper/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#download)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
-[![Built with PySide6 + .NET 8](https://img.shields.io/badge/built%20with-PySide6%20%2B%20.NET%208-512bd4)](#dependencies)
+[![Built with PySide6 + .NET 10](https://img.shields.io/badge/built%20with-PySide6%20%2B%20.NET%2010-512bd4)](#dependencies)
 
 > EfficientAssetRipper is an asset extraction tool for Unreal Engine 4 and 5
 > games that uses CUE4Parse as its core parsing library, with robust support
@@ -86,7 +86,7 @@ Download the latest release from the [Releases](../../releases) page:
 **Requirements for the pre-built release:**
 
 - Windows 10/11 (x64)
-- [.NET 8.0 Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (for CUE4ParseCLI)
+- [.NET 10.0 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (for CUE4ParseCLI)
 - [Blender 4.0+](https://www.blender.org/download/) (for asset processing)
 - [Everything](https://www.voidtools.com/) (must be running for asset search)
 
@@ -369,7 +369,7 @@ EfficientAssetRipper/
 │   ├── material_setup.py    # Shader node graph construction
 │   └── combine_blends.py    # Merge multiple .blend files
 │
-├── cue4parse_cli/           # .NET 8.0 CLI tool
+├── cue4parse_cli/           # .NET 10.0 CLI tool
 │   ├── Program.cs           # NDJSON IPC server for UE archive operations
 │   └── CUE4ParseCLI.csproj  # Project file (CUE4Parse + Newtonsoft.Json)
 │
@@ -447,7 +447,7 @@ Key settings:
 
 - [Blender](https://www.blender.org/) 4.0+ — Headless PSK import and shader node construction
 - [Everything](https://www.voidtools.com/) — Windows file search (must be running)
-- [.NET 8.0 Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) — Required for CUE4ParseCLI
+- [.NET 10.0 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) — Required for CUE4ParseCLI
 - [vgmstream](https://vgmstream.org/) — WEM audio conversion (auto-downloaded by CUE4ParseCLI)
 
 ---

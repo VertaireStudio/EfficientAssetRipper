@@ -1,7 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- net10.0 is forced by the dated CUE4Parse builds (1.2.2.202607 onward),
+         which are the only ones defining EGame.GAME_UE5_7 — UE 5.7 bumped the
+         package LegacyFileVersion to -9, which every earlier build rejects as
+         "Can't load legacy UE3 file". They ship net10.0-only.
+         Publishes are self-contained, so users still need no .NET install. -->
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>CUE4ParseCLI</AssemblyName>
@@ -9,8 +14,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="CUE4Parse" Version="*" />
-    <PackageReference Include="CUE4Parse-Conversion" Version="*" />
+    <!-- Pinned, not floating: a "*" range silently resolved to the newest
+         net8-compatible build (1.2.2) and shipped a CLI that could not read
+         UE 5.7 at all. Bump deliberately, and re-run the loose-file mount
+         check first: 1.2.2.202608 has identical EGame coverage but remounts
+         loose files under a synthetic "<GameDir>" root, which collides with
+         the manual .upk registration below and lists those files twice
+         (Rocket League: 19584 -> 21204 entries, all duplicates). -->
+    <PackageReference Include="CUE4Parse" Version="1.2.2.202607" />
+    <PackageReference Include="CUE4Parse-Conversion" Version="1.2.2.202607" />
     <PackageReference Include="Newtonsoft.Json" Version="13.*" />
   </ItemGroup>
 </Project>

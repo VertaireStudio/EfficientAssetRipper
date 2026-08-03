@@ -31,6 +31,8 @@ the gotchas that aren't obvious from a single file read.
 
 For runtime issues, see [docs/troubleshooting.md](docs/troubleshooting.md).
 For maintainer release steps, see [docs/release-checklist.md](docs/release-checklist.md).
+For cooking your own UE5 fixtures (loose / pak / IoStore / AES-encrypted), see
+[docs/ue5-test-builds.md](docs/ue5-test-builds.md).
 
 ## Tests
 

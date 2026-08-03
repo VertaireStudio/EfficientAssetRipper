@@ -17,7 +17,7 @@ combining models, and other useful features. Asset-export pipeline:
 Two big subsystems live in one repo:
 
 - **Python GUI + orchestration** (PySide6 / Qt6).
-- **CUE4ParseCLI** — a separate .NET 8.0 project that does all UE archive
+- **CUE4ParseCLI** — a separate .NET 10.0 project that does all UE archive
   parsing/extraction, talking to the GUI over NDJSON on stdio.
 
 ## Layout
@@ -30,7 +30,7 @@ Two big subsystems live in one repo:
 | [core/](../core/) | Headless backend logic. No Qt widgets, but Qt signals/threads are OK. |
 | [gui/](../gui/) | All PySide6 UI. Imports from `core/`, never the reverse. |
 | [blender/](../blender/) | Scripts run **inside** Blender as a subprocess (`blender --background --python ...`). They `import bpy` — do NOT import from `core/` or `gui/`. |
-| [cue4parse_cli/](../cue4parse_cli/) | .NET 8.0 single-file CLI, embeds CUE4Parse + Newtonsoft.Json. The Python side never reads `.pak` directly. |
+| [cue4parse_cli/](../cue4parse_cli/) | .NET 10.0 single-file CLI, embeds CUE4Parse + Newtonsoft.Json. The Python side never reads `.pak` directly. |
 | [data/texture_presets.json](../data/texture_presets.json) | Texture-suffix → PBR-slot rules and per-material overrides. Single source of truth for wiring decisions. |
 | [profiles/](../profiles/) | Per-game JSON (gitignored). Has `game_dir`, `aes_keys`, `ue_version`, `psk_processed`, etc. |
 | [cache/](../cache/), [outputs/](../outputs/), [logs/](../logs/) | Gitignored runtime data. `cache/scan_<md5>.json` keyed by game folder hash. `cache/queue_checkpoint.json` survives interrupted batches. |
@@ -115,7 +115,7 @@ source.
 - **Blender 4.0+** — `bpy.ops.psk.import_file` from the bundled
   `io_scene_psk_psa` extension is the default importer (configurable via
   `psk_addon_name` setting).
-- **.NET 8.0 Runtime** — to run CUE4ParseCLI.exe.
+- **.NET 10.0 Runtime** — to run CUE4ParseCLI.exe.
 - **Oodle / vgmstream** — auto-downloaded by CUE4ParseCLI when first
   needed.
 

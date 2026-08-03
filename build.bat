@@ -145,11 +145,11 @@ where dotnet >nul 2>nul
 if %ERRORLEVEL% neq 0 (
     if defined CI (
         echo [4/5] FAIL — .NET SDK not found in CI build.
-        echo      CI builds must ship CUE4ParseCLI; install .NET 8.0 SDK.
+        echo      CI builds must ship CUE4ParseCLI; install .NET 10.0 SDK.
         exit /b 1
     )
     echo [4/5] SKIP — .NET SDK not found ^(CUE4ParseCLI not built^)
-    echo      Install .NET 8.0 SDK to include CUE4ParseCLI in the build.
+    echo      Install .NET 10.0 SDK to include CUE4ParseCLI in the build.
     echo      Marker file written to %DIST_DIR%\CUE4PARSE_CLI_MISSING.txt
     echo.
     > "%DIST_DIR%\CUE4PARSE_CLI_MISSING.txt" echo CUE4ParseCLI was not bundled with this local build ^(no .NET SDK on PATH^).

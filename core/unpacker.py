@@ -34,7 +34,7 @@ class UnpackerProcess(QObject):
     progress = Signal(int, int, str)          # current, total, message
     export_done = Signal(list, list)          # succeeded: list[str], failed: list[dict]
     props_result = Signal(str, list)          # path, list[dict{name, export_type, properties}]
-    exports_listed = Signal(str, list)        # path, list[dict{name, export_type, outer}]
+    exports_listed = Signal(str, list, str)   # path, list[dict{name, export_type, outer}], error ("" if none)
     wwise_scan_result = Signal(dict)          # full scan result dict
     types_scan_progress = Signal(int, int)    # current, total
     types_scan_batch = Signal(list, bool)     # entries, is_final
@@ -310,6 +310,7 @@ class UnpackerProcess(QObject):
             self.exports_listed.emit(
                 msg.get("path", ""),
                 msg.get("exports", []),
+                msg.get("error", "") or "",
             )
 
         elif msg_type == "wwise_scan_result":

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- UE 5.6–5.9 support. CUE4ParseCLI now targets .NET 10 and bundles
+  CUE4Parse 1.2.2.202607; UE 5.7 raised the package `LegacyFileVersion`
+  to -9, which every earlier build rejected outright.
+
+### Fixed
+- A UE version CUE4Parse doesn't define no longer falls back to 5.4 in
+  silence — the CLI warns and names the newest supported version.
+- Auto-detect no longer clamps UE5 minors to 5.4; the ceiling is read
+  from the `EGame` enum instead of a hardcoded constant.
+- `"Can't load legacy UE3 file"` and the missing-mappings parser errors
+  are rewritten into messages that name the actual cause and fix.
+
 ## [0.8.8] - 2026-05-07
 
 Dockable workspace, profile-aware texture resolution, unified media

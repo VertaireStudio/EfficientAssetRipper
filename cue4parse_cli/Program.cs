@@ -16,6 +16,7 @@ using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.MappingsProvider;
+using CUE4Parse.MappingsProvider.Usmap;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Animation;
@@ -34,6 +35,8 @@ using CUE4Parse_Conversion.Textures;
 using CUE4Parse.UE4.Readers;
 using CUE4Parse.UE4.Wwise;
 using CUE4Parse.UE4.Wwise.Objects;
+using CUE4Parse.UE4.Wwise.Objects.HIRC;
+using CUE4Parse.UE4.Wwise.Objects.HIRC.Containers;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
@@ -136,6 +139,29 @@ internal static class Program
     private static string SanitizeMessage(string? msg)
     {
         if (string.IsNullOrEmpty(msg)) return "";
+
+        // CUE4Parse says "Can't load legacy UE3 file" whenever the package
+        // summary's LegacyFileVersion is outside the range it knows — which is
+        // also what a package NEWER than this build looks like (UE 5.7 uses -9).
+        // Reporting that verbatim sends users hunting for a UE3 problem.
+        if (msg.Contains("Can't load legacy UE3 file", StringComparison.Ordinal))
+        {
+            msg = "Unsupported package format — the header version is outside the range this " +
+                  "build of CUE4Parse understands. This usually means the game is built on a " +
+                  "newer Unreal Engine than the bundled parser supports (newest supported: " +
+                  $"{MaxSupportedUe5Version()}).";
+        }
+
+        // Shipping UE5 builds cook properties unversioned, so their field names
+        // live only in a .usmap. Name the profile field that fixes it instead of
+        // leaving the user to guess what a "mapping file" is.
+        if (msg.Contains("unversioned properties but mapping file is missing", StringComparison.Ordinal))
+        {
+            msg = "This game cooks its assets with unversioned properties, so a .usmap mappings " +
+                  "file is required to read them. Set the profile's 'Mappings' field to a .usmap " +
+                  "in Manage Profiles, then re-mount.";
+        }
+
         // Replace Windows drive letters and POSIX absolute paths with <path>.
         var withoutDrives = System.Text.RegularExpressions.Regex.Replace(
             msg, @"[A-Za-z]:[\\/][^\s'""]+", "<path>");
@@ -512,9 +538,20 @@ internal static class Program
         var ueVersionStr = cmd.Value<string>("ue_version") ?? "GAME_UE5_4";
         var mappingsPath = cmd.Value<string>("mappings_path");
 
-        // Parse UE version
+        // Parse UE version. A name this build's CUE4Parse doesn't know used to
+        // fall back to 5.4 in silence, so a profile pinned to a newer engine
+        // mounted at the wrong version with no indication anywhere.
         if (!Enum.TryParse<EGame>(ueVersionStr, true, out var ueVersion))
+        {
             ueVersion = EGame.GAME_UE5_4;
+            Respond(new
+            {
+                type = "warning",
+                message = $"Unknown UE version '{ueVersionStr}' — this build of CUE4Parse does not " +
+                          $"define it. Falling back to {ueVersion}. Newest supported is " +
+                          $"{MaxSupportedUe5Version()}.",
+            });
+        }
 
         // Reset version-mismatch detector for the new mount.
         _versionMismatchCount = 0;
@@ -583,10 +620,38 @@ internal static class Program
             Respond(new { type = "warning", message = $"UPK registration: {SanitizeMessage(ex.Message)}" });
         }
 
-        // Load mappings file if provided
-        if (!string.IsNullOrEmpty(mappingsPath) && File.Exists(mappingsPath))
+        // Load mappings file if provided. A path that is set but unusable used
+        // to be skipped in silence, so a typo looked identical to having no
+        // mappings at all — and the resulting per-asset errors pointed at the
+        // profile field the user had already filled in.
+        if (!string.IsNullOrEmpty(mappingsPath))
         {
-            _provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappingsPath);
+            if (!File.Exists(mappingsPath))
+            {
+                Respond(new
+                {
+                    type = "warning",
+                    message = "Mappings file not found at the configured path — continuing without " +
+                              "mappings. Assets cooked with unversioned properties will not be readable.",
+                });
+            }
+            else
+            {
+                try
+                {
+                    _provider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappingsPath);
+                    Respond(new { type = "info", message = $"Loaded mappings: {Path.GetFileName(mappingsPath)}" });
+                }
+                catch (Exception ex)
+                {
+                    Respond(new
+                    {
+                        type = "warning",
+                        message = $"Mappings file could not be parsed ({SanitizeMessage(ex.Message)}) — " +
+                                  "continuing without mappings. Re-dump the .usmap if it is stale or truncated.",
+                    });
+                }
+            }
         }
 
         // Always submit a zero key for the default GUID to mount unencrypted archives
@@ -845,21 +910,38 @@ internal static class Program
     }
 
     /// <summary>
-    /// Map Major.Minor to EGame string. Clamps minors to supported range.
-    /// UE4: 11-27, UE5: 0-latest (currently 5.4)
+    /// Highest minor version N for which EGame defines GAME_UE{major}_N.
+    /// Probed off the enum rather than hardcoded — a hardcoded ceiling went
+    /// stale at 5.4 and silently clamped every newer game down to it.
+    /// </summary>
+    private static int MaxSupportedMinor(int major)
+    {
+        var highest = 0;
+        for (var minor = 0; minor <= 99; minor++)
+        {
+            if (Enum.TryParse<EGame>($"GAME_UE{major}_{minor}", true, out _))
+                highest = minor;
+        }
+        return highest;
+    }
+
+    private static string MaxSupportedUe5Version() => $"GAME_UE5_{MaxSupportedMinor(5)}";
+
+    /// <summary>
+    /// Map Major.Minor to EGame string. Clamps minors to the range this build's
+    /// CUE4Parse actually defines. UE4 floors at 11 — earlier minors exist in the
+    /// enum but are not meaningfully distinct for asset parsing.
     /// </summary>
     private static string? MapVersionToEGame(int major, int minor)
     {
         if (major == 4)
         {
-            // Clamp UE4 minor to 11-27
-            minor = Math.Max(11, Math.Min(27, minor));
+            minor = Math.Max(11, Math.Min(MaxSupportedMinor(4), minor));
             return $"GAME_UE4_{minor}";
         }
         else if (major == 5)
         {
-            // Clamp UE5 minor to 0-4 (current max)
-            minor = Math.Max(0, Math.Min(4, minor));
+            minor = Math.Max(0, Math.Min(MaxSupportedMinor(5), minor));
             return $"GAME_UE5_{minor}";
         }
         return null;
@@ -1334,7 +1416,12 @@ internal static class Program
     // ─── Texture export ───────────────────────────────────────────────
     private static bool ExportTexture(UTexture2D texture, string outputDir)
     {
-        var decoded = texture.Decode();
+        // Decode() now yields a CTexture (raw pixels + format) rather than an
+        // SKBitmap. Convert once here so the TGA/PNG writers below stay as they
+        // were rather than growing a second pixel-format path.
+        var raw = texture.Decode();
+        if (raw == null) return false;
+        var decoded = TextureEncoder.ToSkBitmap(raw);
         if (decoded == null) return false;
 
         if (_textureFormat == "tga")
@@ -1562,8 +1649,9 @@ internal static class Program
         Directory.CreateDirectory(cacheDir);
         try
         {
-            var tempDll = Path.Combine(cacheDir, OodleHelper.OODLE_DLL_NAME);
-            OodleHelper.DownloadOodleDllAsync(tempDll).GetAwaiter().GetResult();
+            var tempDll = Path.Combine(cacheDir, OodleHelper.OodleFileName);
+            OodleHelper.DownloadOodleDllAsync(ref tempDll, CancellationToken.None)
+                       .GetAwaiter().GetResult();
             if (File.Exists(tempDll) && new FileInfo(tempDll).Length > 0)
             {
                 Respond(new { type = "info", message = "Oodle downloaded via CUE4Parse" });
@@ -2533,8 +2621,8 @@ internal static class Program
             try
             {
                 if (!_provider.TrySaveAsset(bnkPath, out var bnkData)) continue;
-                using var ar = new FByteArchive(bnkPath, bnkData);
-                var wwise = new WwiseReader(ar);
+                using var ar = new FWwiseArchive(bnkPath, bnkData);
+                var wwise = new WwiseReader(ar, new WwiseArchiveSource(), bnkData.Length);
                 ProcessWwiseBank(wwise);
             }
             catch (Exception ex)
@@ -2561,13 +2649,14 @@ internal static class Program
     /// <summary>
     /// Walk a parsed WwiseReader's hierarchy tables and populate _wemIdToName.
     /// Maps SourceId (the .wem numeric filename) → the debug event name from BankStrMap.
-    /// Note: CUE4Parse v1.2.2 exposes direct Event→Action→Sound links only;
+    /// Note: CUE4Parse exposes direct Event→Action→Sound links only;
     /// multi-level container children are not accessible in this API version.
     /// </summary>
     private static void ProcessWwiseBank(WwiseReader wwise)
     {
         var hierarchies = wwise.Hierarchies;
-        var idToString = wwise.IdToString;
+        // Formerly IdToString — same STID name table, renamed upstream.
+        var idToString = wwise.BankIDToFileName;
         if (hierarchies == null || idToString == null || idToString.Count == 0) return;
 
         // Build a flat ID → AbstractHierarchy lookup for this bank
@@ -2592,16 +2681,16 @@ internal static class Program
                         if (actionHier is not HierarchyEventAction action) continue;
                         // Direct sound: EventAction.ReferencedId is a SoundSfxVoice
                         if (byId.TryGetValue(action.ReferencedId, out var target) &&
-                            target is HierarchySoundSfxVoice sound)
+                            target is HierarchySoundSfxVoice sound && sound.Source != null)
                         {
-                            _wemIdToName.TryAdd(sound.SourceId.ToString(), name);
+                            _wemIdToName.TryAdd(sound.Source.SourceId.ToString(), name);
                         }
                     }
                     break;
 
-                case HierarchySoundSfxVoice voice:
+                case HierarchySoundSfxVoice voice when voice.Source != null:
                     // Directly-named sound node — maps immediately
-                    _wemIdToName.TryAdd(voice.SourceId.ToString(), name);
+                    _wemIdToName.TryAdd(voice.Source.SourceId.ToString(), name);
                     break;
             }
         }

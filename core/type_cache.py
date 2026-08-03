@@ -22,6 +22,12 @@ log = logging.getLogger(__name__)
 _CACHE_VERSION = 1
 _DEFAULT_CACHE_DIR = _base_dir() / "cache"
 
+# Cache keys are VFS paths, so a CUE4Parse upgrade that remaps the mount tree
+# invalidates every entry. Bump on any such upgrade to orphan stale caches
+# rather than serve paths the CLI can no longer resolve. Gen 2 = CUE4Parse
+# 1.2.2.202607, which dropped the synthetic "<GameDir>" root for loose files.
+_PARSER_GENERATION = 2
+
 
 # ---------------------------------------------------------------------------
 # Category taxonomy — single source of truth shared by the GUI filter UI
@@ -113,9 +119,9 @@ def category_for_asset_type(asset_type: str) -> str:
 
 
 def compute_fingerprint(game_folder: str, ue_version: str) -> str:
-    """12-char hash of (normalized game folder, UE version)."""
+    """12-char hash of (normalized game folder, UE version, parser generation)."""
     norm = (game_folder or "").strip().rstrip("/\\").lower()
-    payload = f"{norm}|{ue_version or ''}"
+    payload = f"{norm}|{ue_version or ''}|g{_PARSER_GENERATION}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
 
 

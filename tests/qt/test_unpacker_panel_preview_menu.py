@@ -179,6 +179,66 @@ def test_on_export_done_dispatches_mesh_kind(qtbot, tmp_path: Path):
     assert p._exporting is False
 
 
+def test_on_exports_listed_reports_cli_error_not_unsupported_guess(qtbot, mock_qsettings):
+    """An empty listing with a CLI reason must show the reason, not a guess."""
+    p = UnpackerPanel()
+    qtbot.addWidget(p)
+    item = QTreeWidgetItem(p._tree, ["Foo.uasset"])
+    item.setData(0, Qt.ItemDataRole.UserRole, "/Game/Foo.uasset")
+
+    reason = "a .usmap mappings file is required to read them"
+    p._on_exports_listed("/Game/Foo.uasset", [], reason)
+
+    status = p._status_label.text()
+    assert reason in status
+    assert "unsupported format" not in status
+
+
+def test_on_exports_listed_without_error_stays_plain(qtbot, mock_qsettings):
+    """No reason from the CLI means a plain 'no exports' message."""
+    p = UnpackerPanel()
+    qtbot.addWidget(p)
+    item = QTreeWidgetItem(p._tree, ["Foo.uasset"])
+    item.setData(0, Qt.ItemDataRole.UserRole, "/Game/Foo.uasset")
+
+    p._on_exports_listed("/Game/Foo.uasset", [], "")
+
+    assert p._status_label.text() == "No exports found in /Game/Foo.uasset"
+
+
+def test_on_export_done_surfaces_export_error_instead_of_no_data(qtbot, tmp_path: Path):
+    """A failed preview export must report the CLI's reason, not 'no data'."""
+    p = UnpackerPanel()
+    qtbot.addWidget(p)
+    p._mesh_preview_temp_dir = tmp_path
+    missing = tmp_path / "Game" / "Foo.psk"
+    p._pending_temp_preview = (str(missing), "mesh", "/Game/Foo.uasset")
+    p._exporting = True
+
+    reason = "a .usmap mappings file is required to read them"
+    p._on_export_done([], [{"path": "/Game/Foo.uasset", "error": reason}])
+
+    status = p._status_label.text()
+    assert reason in status
+    assert "no mesh data" not in status
+    assert p._pending_temp_preview is None
+    assert p._exporting is False
+
+
+def test_on_export_done_keeps_no_data_message_when_export_clean(qtbot, tmp_path: Path):
+    """With no reported failure, the original 'no data' wording still applies."""
+    p = UnpackerPanel()
+    qtbot.addWidget(p)
+    p._tga_preview_temp_dir = tmp_path
+    missing = tmp_path / "Game" / "Foo.png"
+    p._pending_temp_preview = (str(missing), "texture", "/Game/Foo.uasset")
+    p._exporting = True
+
+    p._on_export_done([], [])
+
+    assert p._status_label.text() == "This asset has no texture data to preview"
+
+
 def test_on_export_done_dispatches_texture_kind(qtbot, tmp_path: Path):
     p = UnpackerPanel()
     qtbot.addWidget(p)

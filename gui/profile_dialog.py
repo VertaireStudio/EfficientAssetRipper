@@ -128,6 +128,7 @@ class AesKeysTableWidget(QWidget):
 # but we keep the editor list short for sanity — users can free-type in the
 # unpacker tab if they need an EGame enum value not listed here)
 _UE_VERSIONS = [
+    "GAME_UE5_9", "GAME_UE5_8", "GAME_UE5_7", "GAME_UE5_6",
     "GAME_UE5_5", "GAME_UE5_4", "GAME_UE5_3", "GAME_UE5_2",
     "GAME_UE5_1", "GAME_UE5_0",
     "GAME_UE4_27", "GAME_UE4_26", "GAME_UE4_25", "GAME_UE4_24",

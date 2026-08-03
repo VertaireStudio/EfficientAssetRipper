@@ -144,6 +144,36 @@ def test_browse_result_signal_carries_entries(unpacker_with_stub, qtbot):
     assert sig.args[1] == [{"name": "Bar", "is_folder": True}]
 
 
+def test_exports_listed_carries_error_field(unpacker_with_stub, qtbot):
+    """The CLI explains an empty export list; that reason must not be dropped."""
+    up, proc = unpacker_with_stub
+    payload = {
+        "type": "exports_listed",
+        "path": "/Game/Foo.uasset",
+        "export_count": 0,
+        "exports": [],
+        "error": "a .usmap mappings file is required",
+    }
+    with qtbot.waitSignal(up.exports_listed, timeout=1000) as sig:
+        proc.feed(json.dumps(payload))
+    assert sig.args[0] == "/Game/Foo.uasset"
+    assert sig.args[1] == []
+    assert sig.args[2] == "a .usmap mappings file is required"
+
+
+def test_exports_listed_error_defaults_to_empty_string(unpacker_with_stub, qtbot):
+    """A successful listing carries no error, not None."""
+    up, proc = unpacker_with_stub
+    payload = {
+        "type": "exports_listed",
+        "path": "/Game/Foo.uasset",
+        "exports": [{"name": "Foo", "export_type": "Texture2D", "outer": ""}],
+    }
+    with qtbot.waitSignal(up.exports_listed, timeout=1000) as sig:
+        proc.feed(json.dumps(payload))
+    assert sig.args[2] == ""
+
+
 def test_export_done_emitted_with_succeeded_and_failed_lists(unpacker_with_stub, qtbot):
     up, proc = unpacker_with_stub
     payload = {
