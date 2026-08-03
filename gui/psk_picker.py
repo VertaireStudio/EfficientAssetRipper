@@ -394,7 +394,7 @@ class PskPickerPanel(QWidget):
                         Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
                     )
                     if pkey in self._processed_paths:
-                        processed_color = QColor(theme.current_scheme()["status_processing"])
+                        processed_color = QColor(theme.current_scheme()["info"])
                         leaf.setForeground(0, processed_color)
                         leaf.setForeground(1, processed_color)
 

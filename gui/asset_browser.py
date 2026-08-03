@@ -221,11 +221,11 @@ class AssetDetailDialog(QDialog):
 def _status_colors():
     c = theme.current_scheme()
     return {
-        "ready":            QColor(c["status_ready"]),
-        "missing_textures": QColor(c["status_warning"]),
-        "no_props":         QColor(c["status_failed"]),
-        "no_materials":     QColor(c["status_failed"]),
-        "processed":        QColor(c["status_processing"]),
+        "ready":            QColor(c["success"]),
+        "missing_textures": QColor(c["warning"]),
+        "no_props":         QColor(c["error"]),
+        "no_materials":     QColor(c["error"]),
+        "processed":        QColor(c["info"]),
     }
 
 

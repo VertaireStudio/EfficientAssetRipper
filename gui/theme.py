@@ -74,6 +74,109 @@ def _mono_family() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Arrow indicator images
+# ---------------------------------------------------------------------------
+# QStyleSheetStyle renders box-styled widgets (QComboBox, QHeaderView) with
+# its internal base style and never routes PE_IndicatorArrowDown through the
+# app's proxy style — so their arrows must be QSS images. QSS url() can't
+# take data URIs, so tinted SVGs are written under cache/theme/.
+
+_THEME_CACHE_DIR = base_dir() / "cache" / "theme"
+
+_ARROW_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+    'viewBox="0 0 {w} {h}"><path d="{path}" fill="{color}" stroke="{color}" '
+    'stroke-width="{sw}" stroke-linejoin="round"/></svg>'
+)
+# direction -> (canvas w, canvas h, triangle path, stroke width).
+# The stroke with round joins is what rounds the corners. Branch glyphs sit
+# on a padded canvas because Qt scales the ::branch image to the whole
+# branch cell — padding keeps the visible triangle small either way.
+_ARROW_SHAPES = {
+    "down":          (10, 6, "M1.5 1.5L8.5 1.5L5 4.5Z", 2),
+    "up":            (10, 6, "M1.5 4.5L8.5 4.5L5 1.5Z", 2),
+    "branch_open":   (20, 20, "M6.5 8.5L13.5 8.5L10 12.5Z", 2.5),
+    "branch_closed": (20, 20, "M8 6.5L8 13.5L12.5 10Z", 2.5),
+}
+
+
+def _arrow_image_url(direction: str, color: str) -> str | None:
+    """Write (once) a tinted arrow SVG and return a forward-slash path for
+    QSS url(), or None if the cache directory is unwritable."""
+    rgb = QColor(color).name().lstrip("#")
+    fp = _THEME_CACHE_DIR / f"arrow_{direction}_{rgb}.svg"
+    # Always rewrite: the shape may change between app versions while the
+    # colour-keyed filename stays the same, and stale cached files would win.
+    try:
+        _THEME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        w, h, path, sw = _ARROW_SHAPES[direction]
+        fp.write_text(
+            _ARROW_SVG.format(w=w, h=h, path=path, sw=sw, color=f"#{rgb}"),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log.warning("Cannot write arrow image %s: %s", fp, exc)
+        return None
+    return fp.as_posix()
+
+
+def _arrow_qss(c: dict[str, str]) -> str:
+    """QSS rules for combobox / header-view arrow indicators.
+
+    Colour is baked into the filename so switching schemes changes the URL,
+    busting QStyleSheetStyle's image cache. Returns "" when the images can't
+    be written — arrows degrade to Qt's default rather than crashing.
+    """
+    down = _arrow_image_url("down", c["text_secondary"])
+    up = _arrow_image_url("up", c["text_secondary"])
+    down_disabled = _arrow_image_url("down", c["text_disabled"])
+    branch_open = _arrow_image_url("branch_open", c["accent"])
+    branch_closed = _arrow_image_url("branch_closed", c["accent"])
+    if down is None or up is None or branch_open is None or branch_closed is None:
+        return ""
+    qss = f"""
+QComboBox::down-arrow {{
+    image: url("{down}");
+    width: 8px;
+    height: 5px;
+}}
+
+QTreeWidget::branch:has-children:closed,
+QTreeView::branch:has-children:closed {{
+    image: url("{branch_closed}");
+}}
+
+QTreeWidget::branch:has-children:open,
+QTreeView::branch:has-children:open {{
+    image: url("{branch_open}");
+}}
+
+QHeaderView::down-arrow {{
+    image: url("{down}");
+    width: 8px;
+    height: 5px;
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+}}
+
+QHeaderView::up-arrow {{
+    image: url("{up}");
+    width: 8px;
+    height: 5px;
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+}}
+"""
+    if down_disabled is not None:
+        qss += f"""
+QComboBox::down-arrow:disabled {{
+    image: url("{down_disabled}");
+}}
+"""
+    return qss
+
+
+# ---------------------------------------------------------------------------
 # Palette builder
 # ---------------------------------------------------------------------------
 
@@ -91,7 +194,7 @@ def _build_palette(c: dict[str, str]) -> QPalette:
     pal.setColor(QPalette.ColorRole.BrightText,      QColor(c["text_bright"]))
     pal.setColor(QPalette.ColorRole.Link,            QColor(c["link"]))
     pal.setColor(QPalette.ColorRole.LinkVisited,     QColor(c["link_hover"]))
-    pal.setColor(QPalette.ColorRole.Highlight,       QColor(c["highlight"]))
+    pal.setColor(QPalette.ColorRole.Highlight,       QColor(c["accent"]))
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor(c["highlight_text"]))
     pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,       QColor(c["text_disabled"]))
     pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(c["text_disabled"]))
@@ -227,15 +330,14 @@ QComboBox::drop-down {{
     width: 24px;
 }}
 
-/* Don't paint the arrow via QSS — the CSS border-triangle technique is
-   unreliable inside Qt's sub-control layout. _BranchCircleStyle paints
-   PE_IndicatorArrowDown for us so the arrow always shows up in the
-   theme's text colour. */
+/* Arrow indicators must be QSS images: QStyleSheetStyle draws box-styled
+   widgets with its internal base style, bypassing _BranchCircleStyle. */
+{_arrow_qss(c)}
 
 QComboBox QAbstractItemView {{
     background-color: {c["bg_mid"]};
     color: {c["text_primary"]};
-    selection-background-color: {c["highlight"]};
+    selection-background-color: {c["accent"]};
     selection-color: {c["highlight_text"]};
     border: 1px solid {c["border"]};
     border-radius: 4px;
@@ -364,7 +466,7 @@ QProgressBar {{
 }}
 
 QProgressBar::chunk {{
-    background-color: {c["progress_chunk"]};
+    background-color: {c["accent"]};
     border-radius: 5px;
 }}
 
@@ -619,14 +721,14 @@ from PySide6.QtWidgets import QProxyStyle, QStyle, QStyleOption
 
 
 class _BranchCircleStyle(QProxyStyle):
-    """Custom drawing for tree branch indicators (solid/hollow circles)
-    and combobox/spinbox down-arrows (filled triangle in theme color).
+    """Custom drawing for spinbox arrows and any tree branch that escapes
+    the stylesheet (filled triangles in theme colors).
 
-    The arrow override exists because QSS ``QComboBox::down-arrow`` cannot
-    reliably paint a CSS-style border-triangle inside Qt's sub-control
-    layout, and leaving the arrow unstyled while restyling the combobox
-    body makes the indicator disappear on some Qt versions. Painting it
-    here keeps it visible regardless of QSS rules.
+    Only widgets *without* QSS rules on the relevant element reach this
+    proxy — QStyleSheetStyle renders styled sub-controls (combobox arrows,
+    header sort indicators, tree branches) with its own internal base style,
+    so those are QSS images instead (see ``_arrow_qss``). The overrides here
+    still cover QSpinBox and friends, which have no QSS rules.
     """
 
     def __init__(self, accent_color: str, arrow_color: str | None = None, base_style=None):
@@ -769,7 +871,7 @@ def apply(app: QApplication, scheme_name: str | None = None) -> None:
     # Build the new style first so Qt has its own reference before we drop
     # ours — `app.setStyle()` takes ownership and deletes the previous one.
     new_style = _BranchCircleStyle(
-        c["progress_chunk"],
+        c["accent"],
         arrow_color=c["text_secondary"],
         base_style="Fusion",
     )

@@ -174,7 +174,7 @@ class QueuePanel(QWidget):
         if row < self._table.rowCount():
             item = self._table.item(row, 1)
             item.setText("Processing...")
-            item.setForeground(_c("status_processing"))
+            item.setForeground(_c("info"))
 
     @Slot(int, str, bool)
     def on_job_completed(self, index: int, name: str, success: bool):
@@ -183,10 +183,10 @@ class QueuePanel(QWidget):
             status_item = self._table.item(row, 1)
             if success:
                 status_item.setText("Done")
-                status_item.setForeground(_c("status_ready"))
+                status_item.setForeground(_c("success"))
             else:
                 status_item.setText("Failed")
-                status_item.setForeground(_c("status_failed"))
+                status_item.setForeground(_c("error"))
             self._progress.setValue(index + 1)
 
     @Slot(int, str, str)
@@ -230,7 +230,7 @@ class QueuePanel(QWidget):
             status_item = self._table.item(row, 1)
             if status_item and status_item.text() in ("Pending", "Processing..."):
                 status_item.setText("Cancelled")
-                status_item.setForeground(_c("status_warning"))
+                status_item.setForeground(_c("warning"))
         parts = [f"{succeeded} succeeded", f"{failed} failed"]
         if cancelled > 0:
             parts.append(f"{cancelled} cancelled")

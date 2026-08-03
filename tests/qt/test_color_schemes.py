@@ -38,6 +38,25 @@ def test_register_custom_scheme_fills_missing_keys():
     assert custom["accent"] == "#abcdef"
 
 
+def test_register_custom_scheme_drops_unknown_keys():
+    """Stored custom schemes from older versions may carry removed tokens;
+    they must not be resurrected into the registry."""
+    register_custom_scheme(
+        "Legacy_Test",
+        {"status_ready": "#123456", "highlight": "#654321", "accent": "#abcdef"},
+    )
+    legacy = SCHEMES.pop("Legacy_Test")
+    assert "status_ready" not in legacy
+    assert "highlight" not in legacy
+    assert legacy["accent"] == "#abcdef"
+    assert set(legacy) == set(SCHEME_KEYS)
+
+
+def test_all_builtin_schemes_have_identical_key_sets():
+    for name in ("Dusk", "Bloom", "Slate", "Midnight"):
+        assert set(SCHEMES[name]) == set(SCHEME_KEYS), name
+
+
 def test_list_scheme_names_sorted():
     names = list_scheme_names()
     assert names == sorted(names)

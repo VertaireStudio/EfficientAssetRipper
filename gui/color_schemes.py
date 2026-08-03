@@ -4,9 +4,6 @@ Each scheme is a simple dict with named color tokens. The active scheme
 is selected by name and consumed by ``gui.theme`` to build palettes and
 stylesheets.  To add a new scheme, copy an existing dict and tweak the
 values — no other code changes needed.
-
-NOTE: Integration code is intentionally left unimplemented.  The
-``apply_scheme()`` hook and settings-panel wiring will be added later.
 """
 
 from __future__ import annotations
@@ -40,11 +37,10 @@ _register("Dusk", {
     "text_disabled":    "#606078",
     "text_bright":      "#f0f0ff",
 
-    # Accent / highlight
+    # Accent
     "accent":           "#7b68ee",
     "accent_hover":     "#8f80ff",
     "accent_muted":     "#554d9e",
-    "highlight":        "#7b68ee",
     "highlight_text":   "#ffffff",
 
     # Links (kept distinct from accent so they read as clickable)
@@ -71,15 +67,7 @@ _register("Dusk", {
     "border_light":     "#4a4a68",
 
     # Progress
-    "progress_chunk":   "#7b68ee",
     "progress_bg":      "#2a2a40",
-
-    # Status dots (asset browser / queue)
-    "status_ready":     "#5ecd73",
-    "status_processing":"#64b5f6",
-    "status_failed":    "#e85a5a",
-    "status_warning":   "#e8c44a",
-    "status_blend":     "#7cacf8",
 })
 
 
@@ -99,7 +87,6 @@ _register("Bloom", {
     "accent":           "#c084d8",
     "accent_hover":     "#d09ae8",
     "accent_muted":     "#8a5c9e",
-    "highlight":        "#c084d8",
     "highlight_text":   "#ffffff",
 
     "link":             "#7ad4ff",
@@ -121,14 +108,7 @@ _register("Bloom", {
     "border":           "#4a3e52",
     "border_light":     "#5c4e66",
 
-    "progress_chunk":   "#c084d8",
     "progress_bg":      "#2e2432",
-
-    "status_ready":     "#7cc89a",
-    "status_processing":"#8ab4e0",
-    "status_failed":    "#d86070",
-    "status_warning":   "#e0b85a",
-    "status_blend":     "#a0b8e0",
 })
 
 
@@ -148,7 +128,6 @@ _register("Slate", {
     "accent":           "#4ea8df",
     "accent_hover":     "#62bcf0",
     "accent_muted":     "#2e6e9e",
-    "highlight":        "#4ea8df",
     "highlight_text":   "#ffffff",
 
     "link":             "#69d2e7",
@@ -170,14 +149,7 @@ _register("Slate", {
     "border":           "#303a4c",
     "border_light":     "#3e4a5e",
 
-    "progress_chunk":   "#4ea8df",
     "progress_bg":      "#1c222c",
-
-    "status_ready":     "#5ec488",
-    "status_processing":"#64b0e8",
-    "status_failed":    "#d65c5c",
-    "status_warning":   "#dab050",
-    "status_blend":     "#78a8d8",
 })
 
 
@@ -197,7 +169,6 @@ _register("Midnight", {
     "accent":           "#5b8af0",
     "accent_hover":     "#70a0ff",
     "accent_muted":     "#3c5ea8",
-    "highlight":        "#5b8af0",
     "highlight_text":   "#ffffff",
 
     "link":             "#7fc8ff",
@@ -219,14 +190,7 @@ _register("Midnight", {
     "border":           "#242e42",
     "border_light":     "#303c54",
 
-    "progress_chunk":   "#5b8af0",
     "progress_bg":      "#141820",
-
-    "status_ready":     "#48c878",
-    "status_processing":"#58a4e8",
-    "status_failed":    "#e04858",
-    "status_warning":   "#d4a840",
-    "status_blend":     "#6898d8",
 })
 
 
@@ -248,10 +212,13 @@ def get_scheme(name: str | None = None) -> dict[str, str]:
 
 
 def register_custom_scheme(name: str, colors: dict[str, str]) -> None:
-    """Register (or overwrite) a user-defined colour scheme."""
-    # Ensure every token is present, filling gaps from the default scheme
+    """Register (or overwrite) a user-defined colour scheme.
+
+    Missing tokens are filled from the default scheme; unknown keys
+    (e.g. tokens removed in older versions) are dropped.
+    """
     base = dict(SCHEMES[DEFAULT_SCHEME])
-    base.update(colors)
+    base.update({k: v for k, v in colors.items() if k in base})
     SCHEMES[name] = base
 
 
