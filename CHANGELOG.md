@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-08-02
+
+UE 5.6–5.9 support, dependency-following export, honest error messages.
 
 ### Added
 - UE 5.6–5.9 support. CUE4ParseCLI now targets .NET 10 and bundles
@@ -13,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to -9, which every earlier build rejected outright.
 - Dependency-following export — exporting a mesh now also exports its
   referenced materials, their parent chains, and all referenced
-  textures, so a single-mesh export is immediately processable without
-  hand-exporting `Content/Materials` and `Content/Textures`.
+  textures, so a single-mesh export is immediately processable.
+- Unexpanded package files in the Unpacker tree carry a + badge so
+  double-click expandability is visible before the first click.
 
 ### Fixed
 - A UE version CUE4Parse doesn't define no longer falls back to 5.4 in
@@ -23,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the `EGame` enum instead of a hardcoded constant.
 - `"Can't load legacy UE3 file"` and the missing-mappings parser errors
   are rewritten into messages that name the actual cause and fix.
+- A mappings path that is missing or unparseable warns at mount instead
+  of being skipped silently; the browser and preview surface the CLI's
+  real error instead of guessing "unsupported format" / "no data".
+- Combobox and header sort arrows were invisible; they are now tinted
+  SVGs that follow the active color scheme.
+- Type-scan caches are keyed to the bundled parser generation, so a
+  CUE4Parse upgrade that remaps the mount tree can't serve stale paths.
 
 ## [0.8.8] - 2026-05-07
 
@@ -298,7 +308,7 @@ Initial public beta release.
   `requires_dotnet_cli` e2e markers.
 - **MIT License** and legal disclaimer for asset extraction usage.
 
-[Unreleased]: https://github.com/exterminathan/EfficientAssetRipper/compare/v0.8.8...HEAD
+[0.9.0]: https://github.com/exterminathan/EfficientAssetRipper/releases/tag/v0.9.0
 [0.8.8]: https://github.com/exterminathan/EfficientAssetRipper/releases/tag/v0.8.8
 [0.8.7]: https://github.com/exterminathan/EfficientAssetRipper/releases/tag/v0.8.7
 [0.8.6]: https://github.com/exterminathan/EfficientAssetRipper/releases/tag/v0.8.6
