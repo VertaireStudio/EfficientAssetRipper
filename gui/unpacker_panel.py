@@ -6,8 +6,8 @@ import json
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 # UE versions exposed in the dropdown — grouped by era, newest first
 _UE_VERSIONS = [
     # UE5
+    "GAME_UE5_9", "GAME_UE5_8", "GAME_UE5_7", "GAME_UE5_6",
     "GAME_UE5_5", "GAME_UE5_4", "GAME_UE5_3", "GAME_UE5_2",
     "GAME_UE5_1", "GAME_UE5_0",
     # UE4 (all minor versions)
@@ -172,6 +173,7 @@ class UnpackerPanel(QWidget):
     # Lazy icon caches — populated on first use after QApplication exists.
     _icon_folder: "QIcon | None" = None
     _icon_package: "QIcon | None" = None
+    _icon_package_open: "QIcon | None" = None
     _icon_audio_virtual: "QIcon | None" = None
     _icon_export_child: "dict[str, QIcon]" = {}
 
@@ -185,10 +187,41 @@ class UnpackerPanel(QWidget):
 
     @classmethod
     def _get_package_icon(cls) -> QIcon:
-        """Small gray rounded-rect to indicate an unexpanded package file."""
+        """Gray rounded-rect with a "+" — a double-clickable, unexpanded
+        package. Distinct from the tree's branch arrow, which only appears
+        once children exist."""
         if cls._icon_package is None:
-            cls._icon_package = cls._make_dot_icon("#aaaaaa", shape="rect")
+            cls._icon_package = cls._make_package_icon(expandable=True)
         return cls._icon_package
+
+    @classmethod
+    def _get_package_open_icon(cls) -> QIcon:
+        """Plain gray rounded-rect for a package whose exports are loaded."""
+        if cls._icon_package_open is None:
+            cls._icon_package_open = cls._make_package_icon(expandable=False)
+        return cls._icon_package_open
+
+    @staticmethod
+    def _make_package_icon(expandable: bool, size: int = 12) -> QIcon:
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor("#aaaaaa")))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(1, 2, size - 2, size - 3, 2, 2)
+        if expandable:
+            pen = QPen(QColor("#20202e"))
+            pen.setWidthF(1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            cx = size / 2.0
+            cy = (size + 1) / 2.0
+            r = size / 4.5
+            p.drawLine(QPointF(cx - r, cy), QPointF(cx + r, cy))
+            p.drawLine(QPointF(cx, cy - r), QPointF(cx, cy + r))
+        p.end()
+        return QIcon(px)
 
     @classmethod
     def _get_audio_virtual_icon(cls) -> QIcon:
@@ -1576,7 +1609,7 @@ class UnpackerPanel(QWidget):
         self._unpacker.get_props(vfs_path)
 
     @Slot(str, list)
-    def _on_exports_listed(self, path: str, exports: list):
+    def _on_exports_listed(self, path: str, exports: list, error: str = ""):
         """Populate child nodes under a package item with its exports."""
         item = self._find_tree_item(path)
         if item is None:
@@ -1587,7 +1620,14 @@ class UnpackerPanel(QWidget):
             return
 
         if not exports:
-            self._status_label.setText(f"No exports found in {path} (may be unsupported format)")
+            # An empty list has two very different causes. Guessing
+            # "unsupported format" when the CLI told us exactly why (missing
+            # mappings, load timeout) is what sends people down wrong paths.
+            if error:
+                self._status_label.setText(f"Could not read {path}: {error}")
+                self.log_message.emit(f"{path}: {error}", "error")
+            else:
+                self._status_label.setText(f"No exports found in {path}")
             return
 
         # Remove any existing children (placeholder or stale) before populating
@@ -1606,6 +1646,9 @@ class UnpackerPanel(QWidget):
             child.setToolTip(0, f"Type: {export_type}\nPackage: {path}")
             child.setIcon(0, self._get_export_child_icon(export_type))
 
+        # The "+" affordance has served its purpose — the branch arrow shows
+        # expandability from here on.
+        item.setIcon(0, self._get_package_open_icon())
         item.setExpanded(True)
         self._status_label.setText(f"{len(exports)} export(s) in {path}")
 
@@ -1976,9 +2019,20 @@ class UnpackerPanel(QWidget):
             elif signal_for_kind is None:
                 self._status_label.setText(f"Preview kind {kind!r} has no signal")
             else:
-                self._status_label.setText(
-                    f"This asset has no {kind} data to preview"
-                )
+                # Nothing landed on disk. "No data to preview" is only true when
+                # the CLI exported cleanly and this asset simply had no payload;
+                # if the export reported an error, that error is the real answer
+                # and hiding it sends people hunting for the wrong problem.
+                reason = next(
+                    (f.get("error") for f in failed if f.get("error")), None)
+                if reason:
+                    self._status_label.setText(f"Cannot preview {kind}: {reason}")
+                    self.log_message.emit(
+                        f"Preview failed for {vfs_path}: {reason}", "error")
+                else:
+                    self._status_label.setText(
+                        f"This asset has no {kind} data to preview"
+                    )
             return
 
         self._exporting = False
