@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from gui.color_schemes import (
+    BUILTIN_SCHEMES,
     DEFAULT_SCHEME,
     SCHEME_KEYS,
     SCHEMES,
@@ -53,7 +54,8 @@ def test_register_custom_scheme_drops_unknown_keys():
 
 
 def test_all_builtin_schemes_have_identical_key_sets():
-    for name in ("Dusk", "Bloom", "Slate", "Midnight"):
+    assert len(BUILTIN_SCHEMES) >= 8
+    for name in BUILTIN_SCHEMES:
         assert set(SCHEMES[name]) == set(SCHEME_KEYS), name
 
 

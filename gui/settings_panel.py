@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
 
 import config
 from gui.color_scheme_dialog import ColorSchemeDialog
+from gui.color_schemes import list_scheme_names
 from gui.widgets import CollapsibleSection, PathPicker
 import gui.theme as theme
 
@@ -56,10 +59,25 @@ class SettingsDialog(QDialog):
         scroll.setWidget(scroll_widget)
         outer.addWidget(scroll, stretch=1)
 
+        # Shared building blocks for section content
+        border_hex = theme.current_scheme().get("border", "#444444")
+
+        def _divider() -> QFrame:
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFixedHeight(1)
+            line.setStyleSheet(f"background-color: {border_hex}; border: none;")
+            return line
+
+        def _sub_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"font-weight: 600; font-size: {theme.FONT_SIZE_LARGE};")
+            return lbl
+
         # --- Tooling paths (global; per-profile paths live in Manage Profiles) ---
-        paths_section = CollapsibleSection("Tooling Paths", start_expanded=False)
         paths_form = QFormLayout()
-        paths_section.setToolTip(
+        paths_label = _sub_label("Tooling Paths")
+        paths_label.setToolTip(
             "These paths apply to every profile. Per-profile paths "
             "(Game folder / Mounted folder / Output folder) are edited under "
             "Manage Profiles."
@@ -97,11 +115,7 @@ class SettingsDialog(QDialog):
         self.cue4parse_cli.setText(config.get("cue4parse_cli"))
         paths_form.addRow("CUE4Parse CLI:", self.cue4parse_cli)
 
-        paths_section.set_content_layout(paths_form)
-        layout.addWidget(paths_section)
-
         # --- Processing group ---
-        proc_section = CollapsibleSection("Processing", start_expanded=False)
         proc_form = QFormLayout()
 
         self.addon_name = QLineEdit(config.get("psk_addon_name"))
@@ -113,11 +127,8 @@ class SettingsDialog(QDialog):
         self.timeout.setValue(config.get_int("timeout_seconds") or 120)
         proc_form.addRow("Timeout per Asset:", self.timeout)
 
-        proc_section.set_content_layout(proc_form)
-        layout.addWidget(proc_section)
-
         # --- Export Formats group ---
-        fmt_section = CollapsibleSection("Export Formats", start_expanded=False)
+        fmt_section = CollapsibleSection("Export Formats", start_expanded=True)
         fmt_form = QFormLayout()
 
         self.texture_format = QComboBox()
@@ -139,49 +150,66 @@ class SettingsDialog(QDialog):
         # --- Presets shortcut (one-shot action, not a section) ---
         presets_btn = QPushButton("Open Texture Presets JSON in Editor")
         presets_btn.clicked.connect(self._open_presets)
-        layout.addWidget(presets_btn)
+        presets_row = QHBoxLayout()
+        presets_row.addStretch()
+        presets_row.addWidget(presets_btn)
+        presets_row.addStretch()
+        layout.addLayout(presets_row)
 
-        # --- Appearance: thin shortcut to the dedicated colour-scheme dialog ---
-        appearance_section = CollapsibleSection("Appearance", start_expanded=False)
-        appearance_layout = QVBoxLayout()
-        active_row = QHBoxLayout()
-        self._active_scheme_label = QLabel(
-            f"Active scheme: {config.get('color_scheme') or theme.current_scheme_name()}"
-        )
-        active_row.addWidget(self._active_scheme_label)
-        active_row.addStretch()
+        # --- Appearance: theme picker + shortcut to the colour-scheme dialog ---
+        appearance_section = CollapsibleSection("Appearance", start_expanded=True)
+        appearance_grid = QGridLayout()
+        appearance_grid.addWidget(QLabel("Theme:"), 0, 0)
+        self.theme_combo = QComboBox()
+        self._reload_theme_combo()
+        self.theme_combo.currentTextChanged.connect(self._on_theme_selected)
+        appearance_grid.addWidget(self.theme_combo, 0, 1)
         customize_btn = QPushButton("Customize Colors…")
         customize_btn.clicked.connect(self._open_color_scheme_dialog)
-        active_row.addWidget(customize_btn)
-        appearance_layout.addLayout(active_row)
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel("UI Scale:"))
+        appearance_grid.addWidget(customize_btn, 0, 2)
+        appearance_grid.addWidget(_divider(), 1, 0, 1, 4)
+        appearance_grid.addWidget(QLabel("UI Scale:"), 2, 0)
         self.ui_scale = QSpinBox()
         self.ui_scale.setRange(theme.UI_SCALE_MIN, theme.UI_SCALE_MAX)
         self.ui_scale.setSingleStep(theme.UI_SCALE_STEP)
         self.ui_scale.setSuffix("%")
         self.ui_scale.setValue(round(theme.ui_scale() * 100))
-        scale_row.addWidget(self.ui_scale)
-        scale_row.addStretch()
-        appearance_layout.addLayout(scale_row)
-        appearance_section.set_content_layout(appearance_layout)
+        # Fill the same column as the theme combo so both controls share a
+        # left edge and width; match the combo's height too.
+        self.ui_scale.setMinimumHeight(self.theme_combo.sizeHint().height())
+        appearance_grid.addWidget(self.ui_scale, 2, 1)
+        appearance_grid.setColumnStretch(3, 1)
+        appearance_section.set_content_layout(appearance_grid)
         layout.addWidget(appearance_section)
 
         # --- Test group ---
-        test_section = CollapsibleSection("Verify Setup", start_expanded=False)
-        test_layout = QVBoxLayout()
-
         test_btn = QPushButton("Test All Paths && SDKs")
+        test_btn.setProperty("cssClass", "accent")
         test_btn.clicked.connect(self._run_tests)
-        test_layout.addWidget(test_btn)
+        test_btn_row = QHBoxLayout()
+        test_btn_row.addStretch()
+        test_btn_row.addWidget(test_btn)
+        test_btn_row.addStretch()
 
         self._test_output = QTextEdit()
         self._test_output.setReadOnly(True)
-        test_layout.addWidget(self._test_output)
 
-        test_section.set_content_layout(test_layout)
-        layout.addWidget(test_section)
+        # --- Combined tooling/setup block: last section, inline sub-groups
+        # under one header, separated by divider lines ---
+        setup_section = CollapsibleSection("Tooling & Setup", start_expanded=True)
+        setup_layout = QVBoxLayout()
+        setup_layout.addWidget(paths_label)
+        setup_layout.addLayout(paths_form)
+        setup_layout.addWidget(_divider())
+        setup_layout.addWidget(_sub_label("Processing"))
+        setup_layout.addLayout(proc_form)
+        setup_layout.addWidget(_divider())
+        setup_layout.addWidget(_sub_label("Verify Setup"))
+        setup_layout.addLayout(test_btn_row)
+        setup_layout.addWidget(self._test_output)
+        setup_section.set_content_layout(setup_layout)
 
+        layout.addWidget(setup_section)
         layout.addStretch()
 
         # --- Buttons (outside scroll area, always visible) ---
@@ -196,6 +224,19 @@ class SettingsDialog(QDialog):
             self._reset_to_defaults
         )
         outer.addWidget(buttons)
+
+        # Open tall enough to show every section expanded (capped to the
+        # screen). Top-level dialogs never auto-shrink, so collapsing a
+        # section afterwards leaves the window size alone.
+        hint = scroll_widget.sizeHint()
+        height = hint.height() + buttons.sizeHint().height() + 48
+        width = max(self.minimumWidth(), hint.width() + 40)
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            height = min(height, avail.height() - 80)
+            width = min(width, avail.width() - 80)
+        self.resize(width, height)
 
     # Path-typed settings: keys checked for existence on save (file only —
     # folder fields all moved to per-profile JSON).
@@ -322,15 +363,36 @@ class SettingsDialog(QDialog):
     # Appearance shortcut
     # ------------------------------------------------------------------
 
+    def _reload_theme_combo(self):
+        """Repopulate the dropdown — the Customize dialog can add/delete
+        custom schemes while Settings stays open."""
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        names = list_scheme_names()
+        self.theme_combo.addItems(names)
+        active = config.get("color_scheme") or theme.current_scheme_name()
+        if active in names:
+            self.theme_combo.setCurrentText(active)
+        self.theme_combo.blockSignals(False)
+
+    def _on_theme_selected(self, name: str):
+        # Applies immediately, matching the Customize dialog's behavior —
+        # theme choice is not gated on the OK button.
+        config.set("color_scheme", name)
+        app = QApplication.instance()
+        if app:
+            theme.apply(app, name)
+        self.settings_changed.emit()
+
     def _open_color_scheme_dialog(self):
         dlg = ColorSchemeDialog(self)
         dlg.scheme_changed.connect(self._on_scheme_chosen)
         dlg.exec()
 
     def _on_scheme_chosen(self, name: str):
-        self._active_scheme_label.setText(f"Active scheme: {name}")
-        # Theme is already applied live by ColorSchemeDialog; emit so any
-        # outer listeners refresh.
+        # Theme is already applied and persisted by ColorSchemeDialog; sync
+        # the dropdown and emit so any outer listeners refresh.
+        self._reload_theme_combo()
         self.settings_changed.emit()
 
     def _open_presets(self):
@@ -402,7 +464,9 @@ class SettingsDialog(QDialog):
                     count, msg = sdk.test_folder_search(gf)
                     results.append(("Folder Search", count > 0, msg))
 
-                    # Try finding PSK files
+                    # Try finding PSK files. Zero hits is not a failure — a
+                    # packed/original game folder has no PSKs until meshes
+                    # are exported from the Unpacker.
                     psk_files = sdk.find_psk_files(folder=gf)
                     if psk_files:
                         results.append((
@@ -411,7 +475,12 @@ class SettingsDialog(QDialog):
                             f"Found {len(psk_files)} PSK/PSKX files, e.g.: {psk_files[0].name}",
                         ))
                     else:
-                        results.append(("PSK Search", False, f"No PSK/PSKX files found under: {gf}"))
+                        results.append((
+                            "PSK Search",
+                            True,
+                            "No PSK/PSKX files yet — normal for a packed game "
+                            "folder; they appear after exporting meshes",
+                        ))
             except Exception as e:
                 results.append(("Everything SDK", False, f"Error: {e}"))
         elif dll_path:

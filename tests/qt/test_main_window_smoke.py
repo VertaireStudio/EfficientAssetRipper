@@ -86,9 +86,10 @@ def test_left_docks_have_browser_picker_unpacker(main_window):
     assert {"dock_asset_browser", "dock_psk_picker", "dock_unpacker"}.issubset(object_names)
 
 
-def test_right_docks_have_queue_log_and_combiner(main_window):
+def test_queue_log_and_combiner_docks_exist(main_window):
     object_names = {dock.objectName() for dock in main_window._docks.values()}
-    assert "dock_queue_log" in object_names
+    assert "dock_queue" in object_names
+    assert "dock_log" in object_names
     assert "dock_blend_combiner" in object_names
 
 

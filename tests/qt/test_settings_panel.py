@@ -155,6 +155,28 @@ def test_reset_to_defaults_aborts_on_no(qtbot, mock_qsettings, monkeypatch):
     assert dlg.addon_name.text() == "stay.put"
 
 
+def test_theme_dropdown_applies_scheme_immediately(qtbot, mock_qsettings):
+    """Picking a theme in the Appearance dropdown persists and applies it
+    without going through the Customize Colors dialog or OK."""
+    import gui.theme as theme
+
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    with qtbot.waitSignal(dlg.settings_changed, timeout=1000):
+        dlg.theme_combo.setCurrentText("Slate")
+    assert config.get("color_scheme") == "Slate"
+    assert theme.current_scheme_name() == "Slate"
+
+
+def test_theme_dropdown_lists_all_schemes(qtbot, mock_qsettings):
+    from gui.color_schemes import list_scheme_names
+
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    items = [dlg.theme_combo.itemText(i) for i in range(dlg.theme_combo.count())]
+    assert items == list_scheme_names()
+
+
 def test_open_presets_warns_on_missing_path(qtbot, mock_qsettings, monkeypatch):
     """Opening a non-existent presets file should warn instead of crashing."""
     from PySide6.QtWidgets import QMessageBox

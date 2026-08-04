@@ -10,16 +10,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDockWidget,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenuBar,
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QSplitter,
     QStatusBar,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -315,17 +312,8 @@ class MainWindow(QMainWindow):
         self._psk_picker = PskPickerPanel()
         self._unpacker_panel = UnpackerPanel()
 
-        queue_log_widget = QWidget()
-        ql_layout = QVBoxLayout(queue_log_widget)
-        ql_layout.setContentsMargins(0, 0, 0, 0)
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._queue = QueuePanel()
-        right_splitter.addWidget(self._queue)
         self._log = LogViewer()
-        right_splitter.addWidget(self._log)
-        right_splitter.setSizes([300, 200])
-        ql_layout.addWidget(right_splitter)
-        self._queue_log_widget = queue_log_widget
 
         self._combiner = BlendCombinerPanel()
         self._combiner.log_message.connect(self._log.append)
@@ -335,22 +323,24 @@ class MainWindow(QMainWindow):
         self._mesh_previewer = MeshPreviewerPanel()
 
         # ── Wrap panels in QDockWidgets (in-window only — no floating) ─
-        # `_dock_specs` is the single source of truth for dock identity, the
-        # default factory layout, and the Window menu's L→R ordering.
-        self._dock_specs: list[tuple[str, str, str, QWidget, Qt.DockWidgetArea, str]] = [
-            # (object_name,            menu label,        title,             widget,                  area,                              side)
-            ("dock_asset_browser",    "Asset Browser",   "Asset Browser",   self._browser,           Qt.DockWidgetArea.LeftDockWidgetArea,  "left"),
-            ("dock_psk_picker",       "PSK Picker",      "PSK Picker",      self._psk_picker,        Qt.DockWidgetArea.LeftDockWidgetArea,  "left"),
-            ("dock_unpacker",         "Unpacker",        "Unpacker",        self._unpacker_panel,    Qt.DockWidgetArea.LeftDockWidgetArea,  "left"),
-            ("dock_queue_log",        "Queue / Log",     "Queue / Log",     self._queue_log_widget,  Qt.DockWidgetArea.RightDockWidgetArea, "right"),
-            ("dock_blend_combiner",   "Blend Combiner",  "Blend Combiner",  self._combiner,          Qt.DockWidgetArea.RightDockWidgetArea, "right"),
-            ("dock_tga_previewer",    "TGA Previewer",   "TGA Previewer",   self._tga_previewer,     Qt.DockWidgetArea.RightDockWidgetArea, "right"),
-            ("dock_text_viewer",      "Text Viewer",     "Text Viewer",     self._text_viewer,       Qt.DockWidgetArea.RightDockWidgetArea, "right"),
-            ("dock_media_previewer",  "Media Preview",   "Media Preview",   self._media_previewer,   Qt.DockWidgetArea.RightDockWidgetArea, "right"),
-            ("dock_mesh_previewer",   "Mesh Preview",    "Mesh Preview",    self._mesh_previewer,    Qt.DockWidgetArea.RightDockWidgetArea, "right"),
+        # `_dock_specs` is the single source of truth for dock identity and
+        # the Window menu ordering; placement lives in
+        # `_apply_default_dock_layout`.
+        self._dock_specs: list[tuple[str, str, str, QWidget]] = [
+            # (object_name,            menu label,        title,             widget)
+            ("dock_unpacker",         "Unpacker",        "Unpacker",        self._unpacker_panel),
+            ("dock_psk_picker",       "PSK Picker",      "PSK Picker",      self._psk_picker),
+            ("dock_asset_browser",    "Asset Browser",   "Asset Browser",   self._browser),
+            ("dock_queue",            "Queue",           "Queue",           self._queue),
+            ("dock_log",              "Log",             "Log",             self._log),
+            ("dock_blend_combiner",   "Blend Combiner",  "Blend Combiner",  self._combiner),
+            ("dock_tga_previewer",    "TGA Previewer",   "TGA Previewer",   self._tga_previewer),
+            ("dock_mesh_previewer",   "Mesh Preview",    "Mesh Preview",    self._mesh_previewer),
+            ("dock_text_viewer",      "Text Viewer",     "Text Viewer",     self._text_viewer),
+            ("dock_media_previewer",  "Media Preview",   "Media Preview",   self._media_previewer),
         ]
         self._docks: dict[str, QDockWidget] = {}
-        for object_name, _menu, title, widget, _area, _side in self._dock_specs:
+        for object_name, _menu, title, widget in self._dock_specs:
             dock = QDockWidget(title, self)
             dock.setObjectName(object_name)
             dock.setWidget(widget)
@@ -366,7 +356,8 @@ class MainWindow(QMainWindow):
         self._asset_browser_dock = self._docks["dock_asset_browser"]
         self._psk_picker_dock = self._docks["dock_psk_picker"]
         self._unpacker_dock = self._docks["dock_unpacker"]
-        self._queue_log_dock = self._docks["dock_queue_log"]
+        self._queue_dock = self._docks["dock_queue"]
+        self._log_dock = self._docks["dock_log"]
         self._combiner_dock = self._docks["dock_blend_combiner"]
         self._tga_previewer_dock = self._docks["dock_tga_previewer"]
         self._text_viewer_dock = self._docks["dock_text_viewer"]
@@ -519,7 +510,7 @@ class MainWindow(QMainWindow):
         # Reset Layout. QDockWidget.toggleViewAction() handles the check
         # state syncing whenever the user closes a dock via its X button.
         window_menu = menubar.addMenu("&Window")
-        for object_name, menu_label, _title, _widget, _area, _side in self._dock_specs:
+        for object_name, menu_label, _title, _widget in self._dock_specs:
             dock = self._docks[object_name]
             action = dock.toggleViewAction()
             action.setText(menu_label)
@@ -642,42 +633,68 @@ class MainWindow(QMainWindow):
     # Dock layout (default + persistence)
     # ------------------------------------------------------------------
 
-    _LAYOUT_SCHEMA_VERSION = 2
+    _LAYOUT_SCHEMA_VERSION = 4
     _LAYOUT_KEY_GEOMETRY = "ui/main_window_geometry"
     _LAYOUT_KEY_STATE = "ui/main_window_state"
     _LAYOUT_KEY_SCHEMA = "ui/main_window_layout_schema"
 
     def _apply_default_dock_layout(self) -> None:
-        """Lay docks out as 3 left + 6 right, both groups tabified.
+        """Factory layout.
+
+        Left area: the browser/picker/unpacker tab group and the Queue side
+        by side, with the Log spanning underneath both. Right area: TGA/Mesh
+        previews tabbed on top, Text/Media tabbed below.
 
         Only used at startup — Reset Layout uses ``restoreState`` against the
         snapshot captured right after this runs, which avoids the
         ``removeDockWidget``-on-hidden-dock crash that Qt can hit on Windows.
         """
-        left_docks: list[QDockWidget] = []
-        right_docks: list[QDockWidget] = []
-        for object_name, _menu, _title, _widget, area, side in self._dock_specs:
-            dock = self._docks[object_name]
-            self.addDockWidget(area, dock)
-            dock.setVisible(True)
-            (left_docks if side == "left" else right_docks).append(dock)
+        d = self._docks
+        left = ("dock_unpacker", "dock_psk_picker", "dock_asset_browser",
+                "dock_queue", "dock_blend_combiner", "dock_log")
+        right = ("dock_tga_previewer", "dock_mesh_previewer",
+                 "dock_text_viewer", "dock_media_previewer")
+        for name in left:
+            self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, d[name])
+            d[name].setVisible(True)
+        for name in right:
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, d[name])
+            d[name].setVisible(True)
 
-        for prev, nxt in zip(left_docks, left_docks[1:]):
-            self.tabifyDockWidget(prev, nxt)
-        for prev, nxt in zip(right_docks, right_docks[1:]):
-            self.tabifyDockWidget(prev, nxt)
+        # Log first spans the full left-area width beneath the unpacker cell,
+        # then that top cell splits into main tabs | queue (nested docking).
+        self.splitDockWidget(d["dock_unpacker"], d["dock_log"], Qt.Orientation.Vertical)
+        self.splitDockWidget(d["dock_unpacker"], d["dock_queue"], Qt.Orientation.Horizontal)
+        self.tabifyDockWidget(d["dock_unpacker"], d["dock_psk_picker"])
+        self.tabifyDockWidget(d["dock_psk_picker"], d["dock_asset_browser"])
+        self.tabifyDockWidget(d["dock_queue"], d["dock_blend_combiner"])
 
-        if left_docks:
-            left_docks[0].raise_()
-        if right_docks:
-            right_docks[0].raise_()
+        # Right column: TGA/Mesh tabs above Text/Media tabs.
+        self.splitDockWidget(d["dock_tga_previewer"], d["dock_text_viewer"], Qt.Orientation.Vertical)
+        self.tabifyDockWidget(d["dock_tga_previewer"], d["dock_mesh_previewer"])
+        self.tabifyDockWidget(d["dock_text_viewer"], d["dock_media_previewer"])
 
-        if left_docks and right_docks:
-            self.resizeDocks(
-                [left_docks[0], right_docks[0]],
-                [600, 600],
-                Qt.Orientation.Horizontal,
-            )
+        d["dock_unpacker"].raise_()
+        d["dock_queue"].raise_()
+        d["dock_mesh_previewer"].raise_()
+        d["dock_text_viewer"].raise_()
+
+        self.resizeDocks(
+            [d["dock_unpacker"], d["dock_queue"], d["dock_mesh_previewer"]],
+            [600, 400, 500],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [d["dock_unpacker"], d["dock_log"]],
+            [650, 220],
+            Qt.Orientation.Vertical,
+        )
+
+        # Hidden by default, but positioned above so the Window menu or an
+        # asset-view call reopens them in their home spot (combiner tabbed
+        # with Queue, TGA top-right group, Media bottom-right group).
+        for name in ("dock_blend_combiner", "dock_tga_previewer", "dock_media_previewer"):
+            d[name].setVisible(False)
 
     def _reset_dock_layout(self) -> None:
         """Window → Reset Layout. Restores defaults and clears persisted state."""
@@ -1408,7 +1425,7 @@ class MainWindow(QMainWindow):
         self._queue.add_to_queue(assets)
         self._log.append(f"Added {count} assets to queue from browser", "info")
         # Switch to queue tab so user sees the result
-        self._raise_dock(self._queue_log_dock)
+        self._raise_dock(self._queue_dock)
 
     def _add_picker_to_queue(self, paths: list[Path]):
         """Resolve PSK paths from the picker and add to queue."""
@@ -1453,7 +1470,7 @@ class MainWindow(QMainWindow):
         self._picker_worker.error.connect(self._on_scan_error)
         self._track_worker(self._picker_worker)
         self._queue.set_resolving(True)
-        self._raise_dock(self._queue_log_dock)
+        self._raise_dock(self._queue_dock)
         self._picker_worker.start()
 
     @Slot(object)
@@ -1581,7 +1598,7 @@ class MainWindow(QMainWindow):
         """Reprocess a single asset (overwrites existing .blend)."""
         asset.processed = False
         self._queue.add_to_queue([asset])
-        self._raise_dock(self._queue_log_dock)
+        self._raise_dock(self._queue_dock)
         self._log.append(f"Queued for reprocessing: {asset.name}", "info")
 
     # ------------------------------------------------------------------

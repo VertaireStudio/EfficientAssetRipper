@@ -29,7 +29,8 @@ def main_window(qtbot, mock_qsettings, tmp_profiles_dir):
 
 
 def test_first_run_falls_back_to_default_layout(qtbot, mock_qsettings, tmp_profiles_dir):
-    """No saved state in QSettings → default layout applies, no docks closed."""
+    """No saved state in QSettings → default layout applies. Blend Combiner
+    and the TGA/Media previews start hidden by design; everything else open."""
     config.set("setup_complete", "1")
     from gui.main_window import MainWindow
 
@@ -38,9 +39,11 @@ def test_first_run_falls_back_to_default_layout(qtbot, mock_qsettings, tmp_profi
     win.show()  # required so dock visibility / toggleViewAction.isChecked() are realised
     qtbot.wait(0)
 
+    hidden_by_default = {"dock_blend_combiner", "dock_tga_previewer", "dock_media_previewer"}
     for dock in win._docks.values():
-        assert dock.toggleViewAction().isChecked() is True, (
-            f"{dock.objectName()} was closed by the default layout"
+        expected = dock.objectName() not in hidden_by_default
+        assert dock.toggleViewAction().isChecked() is expected, (
+            f"{dock.objectName()} visibility != {expected} in the default layout"
         )
 
 
@@ -121,5 +124,5 @@ def test_window_menu_dock_toggles_match_dock_visibility(main_window):
         for a in window_menu.actions()
         if a.text() and not a.isSeparator()
     }
-    for _name, menu_label, _title, _w, _area, _side in win._dock_specs:
+    for _name, menu_label, _title, _w in win._dock_specs:
         assert menu_label in menu_labels, f"missing Window menu entry for {menu_label}"

@@ -420,9 +420,9 @@ class UnpackerPanel(QWidget):
         # ── Category filter checkboxes (directly under search bar) ───
         cat_row = QHBoxLayout()
         cat_row.setContentsMargins(0, 2, 0, 2)
-        cat_row.addWidget(QLabel("Categories:"))
+        cat_row.addWidget(QLabel("Asset Types:"))
         self._cat_checkboxes: dict[str, QCheckBox] = {}
-        for cat_id, label in (
+        for i, (cat_id, label) in enumerate((
             (type_cache_mod.CATEGORY_MESH, "Meshes"),
             (type_cache_mod.CATEGORY_TEXTURE, "Textures"),
             (type_cache_mod.CATEGORY_AUDIO, "Audio"),
@@ -430,13 +430,16 @@ class UnpackerPanel(QWidget):
             (type_cache_mod.CATEGORY_MATERIAL, "Materials"),
             (type_cache_mod.CATEGORY_ANIMATION, "Animations"),
             (type_cache_mod.CATEGORY_OTHER, "Other"),
-        ):
+        )):
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.stateChanged.connect(self._filter_tree)
+            # Even stretch between the boxes spreads them across the full
+            # row width instead of packing left.
+            if i:
+                cat_row.addStretch(1)
             cat_row.addWidget(cb)
             self._cat_checkboxes[cat_id] = cb
-        cat_row.addStretch()
         layout.addLayout(cat_row)
 
         # ── Mount info (middle area) ──────────────────────────────────

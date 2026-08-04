@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 import config
 from gui.color_schemes import (
+    BUILTIN_SCHEMES,
     SCHEME_KEYS,
     SCHEMES,
     get_scheme,
@@ -39,7 +40,7 @@ from gui.color_schemes import (
 import gui.theme as theme
 
 
-_BUILTIN = {"Dusk", "Bloom", "Slate", "Midnight"}
+_BUILTIN = BUILTIN_SCHEMES
 
 # Internal scheme name used while live-previewing edits. Held in the
 # SCHEMES dict only for the lifetime of the dialog and never persisted.

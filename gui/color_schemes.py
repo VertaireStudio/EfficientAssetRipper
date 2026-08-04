@@ -194,11 +194,180 @@ _register("Midnight", {
 })
 
 
+_register("Ember", {
+    # Warm charcoal-brown with a glowing amber accent
+    "bg_darkest":       "#1c1613",
+    "bg_dark":          "#241d18",
+    "bg_mid":           "#2e2620",
+    "bg_light":         "#3a3029",
+    "bg_input":         "#191310",
+
+    "text_primary":     "#e4d9ce",
+    "text_secondary":   "#a8988a",
+    "text_disabled":    "#6e6054",
+    "text_bright":      "#f8f0e6",
+
+    "accent":           "#e08840",
+    "accent_hover":     "#f09c55",
+    "accent_muted":     "#9e6030",
+    # Amber is too light for white selection text — flip to dark.
+    "highlight_text":   "#241505",
+
+    "link":             "#6ec4ff",
+    "link_hover":       "#9cd8ff",
+
+    "success":          "#63c878",
+    "success_hover":    "#78dc8e",
+    "warning":          "#e0c05a",
+    "error":            "#e25a4e",
+    "info":             "#64b5f6",
+
+    "btn_primary":      "#b5661f",
+    "btn_primary_hover":"#cc7830",
+    "btn_secondary":    "#382e26",
+    "btn_secondary_hover":"#46392f",
+    "btn_disabled":     "#2c241e",
+    "btn_text":         "#ecdfd2",
+
+    "border":           "#3e332a",
+    "border_light":     "#4e4034",
+
+    "progress_bg":      "#261f1a",
+})
+
+
+_register("Moss", {
+    # Deep forest greens, easy on the eyes
+    "bg_darkest":       "#141c16",
+    "bg_dark":          "#1a231c",
+    "bg_mid":           "#222e24",
+    "bg_light":         "#2c3a2e",
+    "bg_input":         "#111812",
+
+    "text_primary":     "#d2dcd2",
+    "text_secondary":   "#8ea092",
+    "text_disabled":    "#58685c",
+    "text_bright":      "#eef6ee",
+
+    "accent":           "#58b878",
+    "accent_hover":     "#6cd08c",
+    "accent_muted":     "#35704a",
+    "highlight_text":   "#0f1a13",
+
+    "link":             "#7ac8e8",
+    "link_hover":       "#a4dcf2",
+
+    "success":          "#58c878",
+    "success_hover":    "#70dc90",
+    "warning":          "#d8b44e",
+    "error":            "#d85c5c",
+    "info":             "#62aede",
+
+    "btn_primary":      "#2e8452",
+    "btn_primary_hover":"#3c9862",
+    "btn_secondary":    "#263226",
+    "btn_secondary_hover":"#303f30",
+    "btn_disabled":     "#1e281f",
+    "btn_text":         "#dae4da",
+
+    "border":           "#2e3c30",
+    "border_light":     "#3c4c3e",
+
+    "progress_bg":      "#18211a",
+})
+
+
+_register("Lagoon", {
+    # Dark teal depths with a cyan accent
+    "bg_darkest":       "#101b1e",
+    "bg_dark":          "#152226",
+    "bg_mid":           "#1c2c31",
+    "bg_light":         "#26383e",
+    "bg_input":         "#0d171a",
+
+    "text_primary":     "#cfdde0",
+    "text_secondary":   "#84a0a8",
+    "text_disabled":    "#4e6870",
+    "text_bright":      "#ecf6f8",
+
+    "accent":           "#3cb8c4",
+    "accent_hover":     "#52ccd8",
+    "accent_muted":     "#26747e",
+    "highlight_text":   "#0a2226",
+
+    "link":             "#7fc8ff",
+    "link_hover":       "#a8dcff",
+
+    "success":          "#56c88a",
+    "success_hover":    "#6cdaa0",
+    "warning":          "#d8b44e",
+    "error":            "#de5a62",
+    "info":             "#5fb0e8",
+
+    "btn_primary":      "#237e8c",
+    "btn_primary_hover":"#2f92a2",
+    "btn_secondary":    "#203238",
+    "btn_secondary_hover":"#2a4048",
+    "btn_disabled":     "#192830",
+    "btn_text":         "#d6e4e8",
+
+    "border":           "#263a40",
+    "border_light":     "#334c54",
+
+    "progress_bg":      "#142125",
+})
+
+
+_register("Graphite", {
+    # Neutral monochrome greys with a gold accent
+    "bg_darkest":       "#161616",
+    "bg_dark":          "#1d1d1d",
+    "bg_mid":           "#262626",
+    "bg_light":         "#313131",
+    "bg_input":         "#131313",
+
+    "text_primary":     "#d8d8d8",
+    "text_secondary":   "#9a9a9a",
+    "text_disabled":    "#646464",
+    "text_bright":      "#f4f4f4",
+
+    "accent":           "#d8a848",
+    "accent_hover":     "#e8bc5e",
+    "accent_muted":     "#8a6c2e",
+    "highlight_text":   "#231a06",
+
+    "link":             "#78c0f0",
+    "link_hover":       "#a2d4f6",
+
+    "success":          "#5ec878",
+    "success_hover":    "#74da8c",
+    "warning":          "#e08840",
+    "error":            "#e05252",
+    "info":             "#64b0e8",
+
+    "btn_primary":      "#96742c",
+    "btn_primary_hover":"#aa8638",
+    "btn_secondary":    "#2c2c2c",
+    "btn_secondary_hover":"#383838",
+    "btn_disabled":     "#232323",
+    "btn_text":         "#e0e0e0",
+
+    "border":           "#333333",
+    "border_light":     "#424242",
+
+    "progress_bg":      "#1c1c1c",
+})
+
+
 # ---------------------------------------------------------------------------
 # Default scheme
 # ---------------------------------------------------------------------------
 
 DEFAULT_SCHEME = "Dusk"
+
+# Names registered above — everything else in SCHEMES is user-defined.
+# Frozen at import time, before any custom scheme can be registered.
+BUILTIN_SCHEMES: frozenset[str] = frozenset(SCHEMES)
 
 # All colour token names that every scheme must define
 SCHEME_KEYS: list[str] = list(SCHEMES[DEFAULT_SCHEME].keys())

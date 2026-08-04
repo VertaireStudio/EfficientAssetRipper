@@ -49,7 +49,7 @@ trademarks of Epic Games, Inc. in the United States and elsewhere.
 - **FMOD Audio Support** — Scans FMOD Studio `.bank` files (packed or loose on disk), lists every stream by name under the bank in the tree, and previews/exports them as WAV via vgmstream
 - **Blend Combiner** — Merge multiple `.blend` files into a single scene with grid layout
 - **Multi-Profile** — Per-game configuration profiles (game paths, AES keys, UE version, export directories)
-- **Themeable UI** — 4 built-in color schemes + custom scheme editor with PySide6/Qt6
+- **Themeable UI** — 8 built-in color schemes + custom scheme editor with PySide6/Qt6
 
 ---
 
@@ -434,7 +434,7 @@ Key settings:
 | `output_dir`      | Default output directory for .blend files          |
 | `cue4parse_cli`   | Path to CUE4ParseCLI.exe                           |
 | `timeout_seconds` | Blender processing timeout (default: 120s)         |
-| `color_scheme`    | UI theme (Dusk, Bloom, Slate, Midnight, or custom) |
+| `color_scheme`    | UI theme (Dusk, Bloom, Slate, Midnight, Ember, Moss, Lagoon, Graphite, or custom) |
 
 ---
 
