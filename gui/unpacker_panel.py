@@ -113,6 +113,11 @@ class UnpackerPanel(QWidget):
         self._wwise_audio_map: dict[str, list[dict]] = {}  # event_folder → [{debug_name, wem_vfs_path, ...}]
         self._wwise_scan_done = False
         self._pending_wwise_export: tuple[list[dict], str] | None = None  # (entries, output_dir)
+
+        # FMOD bank data (populated by scan after mount)
+        self._fmod_banks: dict[str, list[dict]] = {}  # bank_vfs_path → [{index, name, sample_rate, duration_ms}]
+        self._fmod_scan_done = False
+        self._pending_fmod_export: tuple[list[dict], str] | None = None  # (entries, output_dir)
         # Single temp dir shared by audio + video previews — the MediaPreviewerPanel
         # owns the parent and exposes per-kind subdirs so per-Clear rmtree only
         # nukes one half. Set from main_window.
@@ -319,6 +324,10 @@ class UnpackerPanel(QWidget):
             self._wwise_audio_map = {}
             self._wwise_scan_done = False
             self._pending_wwise_export = None
+            # Clear FMOD state
+            self._fmod_banks = {}
+            self._fmod_scan_done = False
+            self._pending_fmod_export = None
             # Drop any in-flight type-cache state — re-mount will re-scan or
             # load the cache for the new game.
             self._type_cache = None
@@ -450,6 +459,7 @@ class UnpackerPanel(QWidget):
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._tree.itemExpanded.connect(self._on_item_expanded)
         self._tree.itemCollapsed.connect(self._on_item_collapsed)
+        self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.itemSelectionChanged.connect(self._maybe_expand_export_section)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -549,6 +559,7 @@ class UnpackerPanel(QWidget):
         self._unpacker.props_result.connect(self._on_props_result)
         self._unpacker.exports_listed.connect(self._on_exports_listed)
         self._unpacker.wwise_scan_result.connect(self._on_wwise_scan_result)
+        self._unpacker.fmod_scan_result.connect(self._on_fmod_scan_result)
         self._unpacker.types_scan_progress.connect(self._on_types_scan_progress)
         self._unpacker.types_scan_batch.connect(self._on_types_scan_batch)
         self._unpacker.types_scan_done.connect(self._on_types_scan_done)
@@ -565,7 +576,7 @@ class UnpackerPanel(QWidget):
     # Extension-based fallback for files we don't have export-type info on.
     _MESH_FILE_EXTS = (".psk", ".pskx")
     _TEXTURE_FILE_EXTS = (".tga", ".png", ".dds", ".bmp", ".jpg", ".jpeg")
-    _AUDIO_FILE_EXTS = (".wav", ".ogg", ".wem", ".bnk", ".ewem")
+    _AUDIO_FILE_EXTS = (".wav", ".ogg", ".wem", ".bnk", ".ewem", ".bank")
     _PACKAGE_FILE_EXTS = (".uasset", ".upk", ".umap")
 
     def _row_categories(self, item: QTreeWidgetItem) -> "set[str] | None":
@@ -879,7 +890,7 @@ class UnpackerPanel(QWidget):
 
         info = f"Mounted: {archive_count} archives, {file_count:,} files"
         if loose_file_count:
-            info += f" ({loose_file_count:,} loose .upk/.wem/.ewem/.bnk)"
+            info += f" ({loose_file_count:,} loose .upk/.wem/.ewem/.bnk/.bank)"
         if unmounted_count:
             info += f" ({unmounted_count} archives need AES keys)"
         if keys_submitted:
@@ -909,6 +920,12 @@ class UnpackerPanel(QWidget):
         self._wwise_audio_map = {}
         self._wwise_scan_done = False
         self._unpacker.scan_wwise_events()
+        # The FMOD scan is NOT sent here — while the wwise scan runs, the CLI's
+        # cancel-support reader discards unrecognized commands, so a back-to-back
+        # scan_fmod_banks would be silently dropped. _on_wwise_scan_result sends
+        # it once the wwise scan has actually finished.
+        self._fmod_banks = {}
+        self._fmod_scan_done = False
 
         # Try to reuse a cached type map for this game; otherwise scan fresh.
         self._begin_type_cache_load()
@@ -999,6 +1016,12 @@ class UnpackerPanel(QWidget):
     def _on_wwise_scan_result(self, result: dict):
         """Handle the result of scanning AkAudioEvent assets."""
         self._wwise_scan_done = True
+
+        # Chain the FMOD scan behind the wwise scan — sending it any earlier
+        # gets it dropped by the CLI's during-export command reader.
+        if not self._fmod_scan_done:
+            self._unpacker.scan_fmod_banks()
+
         if not result.get("found"):
             return
 
@@ -1045,6 +1068,109 @@ class UnpackerPanel(QWidget):
         # Recurse into children
         for i in range(item.childCount()):
             self._refresh_wwise_recursive(item.child(i))
+
+    # ------------------------------------------------------------------
+    # FMOD bank scan
+    # ------------------------------------------------------------------
+
+    @Slot(dict)
+    def _on_fmod_scan_result(self, result: dict):
+        """Handle the result of scanning FMOD .bank files for streams."""
+        self._fmod_scan_done = True
+        if not result.get("found"):
+            return
+
+        self._fmod_banks = {}
+        for bank in result.get("banks", []):
+            bank_path = bank.get("bank_vfs_path", "")
+            streams = bank.get("streams", [])
+            if bank_path and streams:
+                self._fmod_banks[bank_path] = streams
+
+        total_banks = result.get("total_banks", 0)
+        total_streams = result.get("total_streams", 0)
+        msg = f"FMOD scan: {total_streams} streams in {total_banks} banks"
+        self._status_label.setText(msg)
+        self.log_message.emit(msg, "success")
+
+        # Inject stream rows under any bank items already in the tree.
+        self._tree.setUpdatesEnabled(False)
+        try:
+            stack = [self._tree.invisibleRootItem()]
+            while stack:
+                parent = stack.pop()
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    vfs_path = child.data(0, Qt.ItemDataRole.UserRole) or ""
+                    if vfs_path in self._fmod_banks:
+                        self._inject_fmod_streams(child)
+                    elif child.childCount():
+                        stack.append(child)
+        finally:
+            self._tree.setUpdatesEnabled(True)
+
+    @staticmethod
+    def _fmod_bank_folder(bank_path: str) -> str:
+        """Output subfolder for a bank's streams: the bank path minus .bank."""
+        p = bank_path[:-5] if bank_path.lower().endswith(".bank") else bank_path
+        return p.strip("/")
+
+    @staticmethod
+    def _fmod_stream_name(bank_path: str, stream: dict) -> str:
+        """Stable, collision-free filename stem for a bank stream.
+
+        The FSB name table is optional and names may repeat, so the 1-based
+        stream index is always part of the stem.
+        """
+        idx = int(stream.get("index", 0) or 0)
+        name = (stream.get("name") or "").strip()
+        if name:
+            return f"{idx:04d}_{name}"
+        stem = bank_path.rsplit("/", 1)[-1]
+        if stem.lower().endswith(".bank"):
+            stem = stem[:-5]
+        return f"{stem}_{idx:04d}"
+
+    @staticmethod
+    def _fs_sanitize(segment: str) -> str:
+        """Mirror the CLI's SanitizeName (invalid chars + spaces → '_') so
+        cache-path predictions match what actually lands on disk."""
+        cleaned = "".join(
+            "_" if (c in '<>:"/\\|?*' or c == " " or ord(c) < 32) else c
+            for c in segment)
+        return cleaned.strip("_")
+
+    def _fmod_disk_relpath(self, bank_path: str, stream: dict) -> Path:
+        """Relative disk path the CLI will write this stream's WAV to."""
+        folder = self._fmod_bank_folder(bank_path)
+        parts = [self._fs_sanitize(p) for p in folder.split("/") if p]
+        name = self._fs_sanitize(self._fmod_stream_name(bank_path, stream))
+        return Path(*parts) / f"{name}.wav"
+
+    def _fmod_entry(self, bank_path: str, stream: dict) -> dict:
+        return {
+            "bank_vfs_path": bank_path,
+            "stream_index": int(stream.get("index", 0) or 0),
+            "target_name": self._fmod_stream_name(bank_path, stream),
+            "target_folder": self._fmod_bank_folder(bank_path),
+        }
+
+    def _inject_fmod_streams(self, bank_item: QTreeWidgetItem):
+        """Add virtual stream child rows under a .bank tree item."""
+        bank_path = bank_item.data(0, Qt.ItemDataRole.UserRole) or ""
+        streams = self._fmod_banks.get(bank_path, [])
+        if not streams or bank_item.childCount():
+            return
+        for stream in streams:
+            display = f"{self._fmod_stream_name(bank_path, stream)}.wav"
+            child = QTreeWidgetItem([display])
+            child.setData(0, Qt.ItemDataRole.UserRole, bank_path)
+            child.setData(0, Qt.ItemDataRole.UserRole + 1, False)  # not a folder
+            child.setData(0, Qt.ItemDataRole.UserRole + 2,
+                          {"bank_vfs_path": bank_path, **stream})
+            child.setForeground(0, Qt.GlobalColor.cyan)
+            child.setIcon(0, self._get_audio_virtual_icon())
+            bank_item.addChild(child)
 
     @Slot(str, list)
     def _on_browse_result(self, path: str, entries: list):
@@ -1102,6 +1228,8 @@ class UnpackerPanel(QWidget):
             if icon:
                 item.setIcon(0, icon)
             parent.addChild(item)
+            if self._fmod_scan_done:
+                self._inject_fmod_streams(item)  # no-op unless a scanned .bank
 
         # ── WWise: inject virtual audio items into Events subfolders ──
         if self._wwise_scan_done and self._wwise_events_prefix:
@@ -1562,6 +1690,27 @@ class UnpackerPanel(QWidget):
         self._status_label.setText(f"Loading props for {vfs_path}...")
         self._unpacker.get_props(vfs_path)
 
+    def _request_package_exports(self, item: QTreeWidgetItem, vfs_path: str) -> None:
+        """Fetch a package's export list once; children land via exports_listed."""
+        if item.data(0, Qt.ItemDataRole.UserRole + 3):
+            return
+        item.setData(0, Qt.ItemDataRole.UserRole + 3, True)  # mark as fetch-in-progress
+        self._status_label.setText(f"Listing exports in {vfs_path}...")
+        self._unpacker.list_exports(vfs_path)
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_item_clicked(self, item: QTreeWidgetItem, column: int):
+        """Single click on a "+" package row lists its exports, matching the
+        Asset Browser's single-click convention. Modified clicks (Ctrl/Shift
+        multi-select) stay pure selection gestures."""
+        if QApplication.keyboardModifiers() != Qt.KeyboardModifier.NoModifier:
+            return
+        if item.data(0, Qt.ItemDataRole.UserRole + 1):  # folder
+            return
+        vfs_path = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        if Path(vfs_path.lower()).suffix in self._PACKAGE_EXTS_FOR_MESH:
+            self._request_package_exports(item, vfs_path)
+
     @Slot(QTreeWidgetItem, int)
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         is_folder = item.data(0, Qt.ItemDataRole.UserRole + 1)
@@ -1578,16 +1727,17 @@ class UnpackerPanel(QWidget):
         if not vfs_path:
             return
 
-        # Package files (.upk, .uasset, .umap) → list exports as child nodes
+        # Scanned FMOD banks carry their streams as real children — the
+        # double-click expand toggle is the whole interaction.
+        if vfs_path in self._fmod_banks:
+            return
+
+        # Package files (.upk, .uasset, .umap) → list exports as child nodes.
+        # Normally handled by the single-click path; this covers keyboard
+        # activation and is a no-op once the fetch flag is set.
         lower = vfs_path.lower()
-        _PACKAGE_EXTS = (".upk", ".uasset", ".umap")
-        if any(lower.endswith(ext) for ext in _PACKAGE_EXTS):
-            # Only fetch if we haven't already populated children (check for placeholder or no children)
-            already_populated = item.data(0, Qt.ItemDataRole.UserRole + 3)
-            if not already_populated:
-                item.setData(0, Qt.ItemDataRole.UserRole + 3, True)  # mark as fetch-in-progress
-                self._status_label.setText(f"Listing exports in {vfs_path}...")
-                self._unpacker.list_exports(vfs_path)
+        if Path(lower).suffix in self._PACKAGE_EXTS_FOR_MESH:
+            self._request_package_exports(item, vfs_path)
             return
 
         # Regular audio files → audio preview (exported or temp)
@@ -1673,7 +1823,10 @@ class UnpackerPanel(QWidget):
         return None
 
     def _try_audio_preview(self, audio_data: dict):
-        """Resolve a virtual WWise audio entry to a local file and emit media_preview."""
+        """Resolve a virtual audio entry (WWise or FMOD) and emit media_preview."""
+        if audio_data.get("bank_vfs_path"):
+            self._try_fmod_preview(audio_data)
+            return
         audio_format = config.get("export_audio_format") or "wav"
         evt_folder = audio_data.get("event_folder", "")
         full_folder = (
@@ -1720,6 +1873,50 @@ class UnpackerPanel(QWidget):
         self._status_label.setText(f"Exporting for preview: {audio_data['debug_name']}")
         self._begin_export()
         self._unpacker.export_wwise_audio([entry], temp_dir, audio_format=audio_format)
+
+    def _try_fmod_preview(self, audio_data: dict):
+        """Resolve a virtual FMOD stream entry to a local file and emit media_preview.
+
+        FMOD exports are always WAV — vgmstream decodes the bank subsong
+        directly, so the export_audio_format setting doesn't apply here.
+        """
+        bank_path = audio_data["bank_vfs_path"]
+        name = self._fmod_stream_name(bank_path, audio_data)
+        disk_rel = self._fmod_disk_relpath(bank_path, audio_data)
+
+        # Check already-exported location first
+        if self._export_output_dir:
+            local_path = Path(self._export_output_dir) / disk_rel
+            if local_path.is_file():
+                self.media_preview.emit(str(local_path))
+                return
+
+        # Check temp dir
+        audio_temp = self._temp_dir_for_kind("audio")
+        if audio_temp:
+            temp_path = audio_temp / disk_rel
+            if temp_path.is_file():
+                self.media_preview.emit(str(temp_path))
+                return
+
+        # Export to temp dir for preview
+        if self._exporting:
+            self._status_label.setText("Export in progress — try again after it finishes")
+            return
+        if not self._mounted:
+            self._status_label.setText("Mount an archive first")
+            return
+        if not audio_temp:
+            self._status_label.setText("Audio not exported yet — export it first to preview")
+            return
+
+        entry = self._fmod_entry(bank_path, audio_data)
+        expected = audio_temp / disk_rel
+        self._pending_temp_preview = (str(expected), "audio", bank_path)
+
+        self._status_label.setText(f"Exporting for preview: {name}")
+        self._begin_export()
+        self._unpacker.export_fmod_audio([entry], str(audio_temp))
 
     @Slot(str, list)
     def _on_props_result(self, path: str, exports: list):
@@ -1798,6 +1995,15 @@ class UnpackerPanel(QWidget):
         # Split selected items into regular VFS files and virtual audio items
         regular_paths = []
         wwise_entries = []
+        fmod_entries = []
+        seen_fmod_streams: set[tuple[str, int]] = set()
+
+        def _add_fmod(bank_path: str, stream: dict) -> None:
+            key = (bank_path, int(stream.get("index", 0) or 0))
+            if key not in seen_fmod_streams:
+                seen_fmod_streams.add(key)
+                fmod_entries.append(self._fmod_entry(bank_path, stream))
+
         for item in selected:
             is_folder = item.data(0, Qt.ItemDataRole.UserRole + 1)
             vfs_path = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1805,6 +2011,9 @@ class UnpackerPanel(QWidget):
             if is_folder or not vfs_path:
                 continue
             if audio_data:
+                if audio_data.get("bank_vfs_path"):
+                    _add_fmod(audio_data["bank_vfs_path"], audio_data)
+                    continue
                 evt_folder = audio_data.get("event_folder", "")
                 full_folder = (self._wwise_events_prefix.rstrip("/") + "/" + evt_folder).strip("/") if evt_folder else self._wwise_events_prefix.rstrip("/")
                 wwise_entries.append({
@@ -1812,29 +2021,38 @@ class UnpackerPanel(QWidget):
                     "target_name": audio_data["debug_name"],
                     "target_folder": full_folder,
                 })
+            elif vfs_path in self._fmod_banks:
+                # A scanned bank row stands for all of its streams — decoded
+                # WAVs are what the user is after, not the raw container.
+                for stream in self._fmod_banks[vfs_path]:
+                    _add_fmod(vfs_path, stream)
             else:
                 regular_paths.append(vfs_path)
 
-        if not regular_paths and not wwise_entries:
+        if not regular_paths and not wwise_entries and not fmod_entries:
             QMessageBox.information(self, "No Files", "Selection contains only folders. Use 'Export Folder' instead.")
             return
 
         self._begin_export()
 
-        if regular_paths and wwise_entries:
-            # Chain: send regular export first, queue wwise for after it completes
-            self._pending_wwise_export = (wwise_entries, output_dir)
+        # Chain: regular export first, then wwise, then fmod — each queued
+        # stage is kicked off by _on_export_done when the previous completes.
+        if regular_paths:
+            if wwise_entries:
+                self._pending_wwise_export = (wwise_entries, output_dir)
+            if fmod_entries:
+                self._pending_fmod_export = (fmod_entries, output_dir)
             self._unpacker.export(regular_paths, output_dir, self._get_formats(),
                                   texture_format=config.get("export_texture_format"),
                                   audio_format=config.get("export_audio_format"))
-        elif regular_paths:
-            self._unpacker.export(regular_paths, output_dir, self._get_formats(),
-                                  texture_format=config.get("export_texture_format"),
-                                  audio_format=config.get("export_audio_format"))
-        else:
+        elif wwise_entries:
+            if fmod_entries:
+                self._pending_fmod_export = (fmod_entries, output_dir)
             self._unpacker.export_wwise_audio(
                 wwise_entries, output_dir,
                 audio_format=config.get("export_audio_format"))
+        else:
+            self._unpacker.export_fmod_audio(fmod_entries, output_dir)
 
     def _export_folder(self):
         selected = self._tree.selectedItems()
@@ -1889,6 +2107,18 @@ class UnpackerPanel(QWidget):
         if wwise_entries:
             # Chain: send folder export first, queue wwise for after it completes
             self._pending_wwise_export = (wwise_entries, output_dir)
+
+        # Collect FMOD stream entries for any scanned bank under a selected folder.
+        fmod_entries = []
+        if self._fmod_scan_done and self._fmod_banks:
+            for vfs_path in folder_paths:
+                prefix = vfs_path.rstrip("/") + "/"
+                for bank_path, streams in self._fmod_banks.items():
+                    if bank_path.startswith(prefix):
+                        fmod_entries.extend(
+                            self._fmod_entry(bank_path, s) for s in streams)
+        if fmod_entries:
+            self._pending_fmod_export = (fmod_entries, output_dir)
 
         # Export each selected folder. Only the *last* request will trigger
         # the chained WWise export; the CLI processes them sequentially.
@@ -1969,6 +2199,14 @@ class UnpackerPanel(QWidget):
             self._unpacker.export_wwise_audio(
                 entries, out_dir,
                 audio_format=config.get("export_audio_format"))
+            return
+
+        # Then any pending FMOD stream export (chained after wwise/regular)
+        if self._pending_fmod_export:
+            entries, out_dir = self._pending_fmod_export
+            self._pending_fmod_export = None
+            self._status_label.setText(f"Exporting {len(entries)} FMOD streams...")
+            self._unpacker.export_fmod_audio(entries, out_dir)
             return
 
         # Handle temp-export-for-preview (audio / mesh / texture)
@@ -2254,6 +2492,10 @@ class UnpackerPanel(QWidget):
         self._wwise_audio_map = {}
         self._wwise_scan_done = False
         self._pending_wwise_export = None
+        # Clear FMOD state
+        self._fmod_banks = {}
+        self._fmod_scan_done = False
+        self._pending_fmod_export = None
 
     def shutdown(self):
         """Stop the CLI process (called on app exit)."""

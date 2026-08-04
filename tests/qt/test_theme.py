@@ -68,6 +68,18 @@ def test_build_qss_contains_combo_arrow_rules(app, tmp_path, monkeypatch):
         assert f'url("{fp.as_posix()}")' in qss
 
 
+def test_build_qss_contains_dock_separator_rules(app, tmp_path, monkeypatch):
+    """Dock-area separators need an explicit size — the separator is the
+    resize hit zone, and the style default is too thin to grab."""
+    from gui.color_schemes import get_scheme
+
+    monkeypatch.setattr(theme, "_THEME_CACHE_DIR", tmp_path / "theme")
+    qss = theme._build_qss(get_scheme("Dusk"))
+    assert "QMainWindow::separator" in qss
+    assert "QMainWindow::separator:hover" in qss
+    assert "QSplitter::handle:hover" in qss
+
+
 def test_arrow_files_are_color_keyed(app, tmp_path, monkeypatch):
     """Different schemes must produce differently-named arrow files so the
     QSS image cache (keyed by URL) is busted on scheme switch."""
@@ -90,3 +102,59 @@ def test_build_qss_degrades_when_cache_unwritable(app, tmp_path, monkeypatch):
     qss = theme._build_qss(get_scheme("Dusk"))
     assert "QComboBox::down-arrow" not in qss
     assert "QComboBox {" in qss
+
+
+# ---------------------------------------------------------------------------
+# UI scale
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def restore_scale(app):
+    """Reset the global UI scale (and the applied stylesheet) after the test."""
+    yield
+    theme.set_ui_scale(1.0)
+    theme.apply(app)
+
+
+def test_scale_qss_scales_px_and_pt():
+    qss = "* { font-size: 10pt; padding: 4px 8px; }"
+    assert theme._scale_qss(qss, 1.5) == "* { font-size: 15pt; padding: 6px 12px; }"
+
+
+def test_scale_qss_preserves_hairlines_and_sign():
+    qss = "QFrame { border: 1px solid red; margin: -5px 0; top: -1px; }"
+    scaled = theme._scale_qss(qss, 0.5)
+    # 1px borders must never vanish; negative offsets keep their sign.
+    assert "border: 1px solid red" in scaled
+    assert "margin: -3px 0" in scaled or "margin: -2px 0" in scaled
+    assert "top: -1px" in scaled
+
+
+def test_scale_qss_floors_font_size():
+    assert theme._scale_qss("font-size: 9pt;", 0.5) == "font-size: 6pt;"
+
+
+def test_set_ui_scale_clamps():
+    theme.set_ui_scale(10.0)
+    assert theme.ui_scale() == theme.UI_SCALE_MAX / 100.0
+    theme.set_ui_scale(0.01)
+    assert theme.ui_scale() == theme.UI_SCALE_MIN / 100.0
+    theme.set_ui_scale(1.0)
+    assert theme.ui_scale() == 1.0
+
+
+def test_apply_rebuilds_when_scale_changes(app, restore_scale):
+    theme.apply(app, "Dusk")
+    style_a = theme._current_style
+    theme.set_ui_scale(1.5)
+    theme.apply(app, "Dusk")
+    assert theme._current_style is not style_a
+    assert "font-size: 15pt" in app.styleSheet()
+
+
+def test_apply_no_op_when_scale_unchanged(app, restore_scale):
+    theme.set_ui_scale(1.2)
+    theme.apply(app, "Dusk")
+    style_a = theme._current_style
+    theme.apply(app, "Dusk")
+    assert theme._current_style is style_a

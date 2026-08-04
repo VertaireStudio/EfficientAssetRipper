@@ -12,6 +12,7 @@ import os
 from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -153,6 +154,16 @@ class SettingsDialog(QDialog):
         customize_btn.clicked.connect(self._open_color_scheme_dialog)
         active_row.addWidget(customize_btn)
         appearance_layout.addLayout(active_row)
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("UI Scale:"))
+        self.ui_scale = QSpinBox()
+        self.ui_scale.setRange(theme.UI_SCALE_MIN, theme.UI_SCALE_MAX)
+        self.ui_scale.setSingleStep(theme.UI_SCALE_STEP)
+        self.ui_scale.setSuffix("%")
+        self.ui_scale.setValue(round(theme.ui_scale() * 100))
+        scale_row.addWidget(self.ui_scale)
+        scale_row.addStretch()
+        appearance_layout.addLayout(scale_row)
         appearance_section.set_content_layout(appearance_layout)
         layout.addWidget(appearance_section)
 
@@ -260,6 +271,12 @@ class SettingsDialog(QDialog):
         config.set("export_texture_format", self.texture_format.currentText())
         config.set("export_audio_format", self.audio_format.currentText())
 
+        config.set("ui_scale", self.ui_scale.value())
+        theme.set_ui_scale(self.ui_scale.value() / 100.0)
+        app = QApplication.instance()
+        if app:
+            theme.apply(app)
+
         self.settings_changed.emit()
         self.accept()
 
@@ -299,6 +316,7 @@ class SettingsDialog(QDialog):
         self.timeout.setValue(int(defaults.get("timeout_seconds", 120)))
         self.texture_format.setCurrentText(defaults.get("export_texture_format", "png"))
         self.audio_format.setCurrentText(defaults.get("export_audio_format", "wav"))
+        self.ui_scale.setValue(int(defaults.get("ui_scale", 100)))
 
     # ------------------------------------------------------------------
     # Appearance shortcut

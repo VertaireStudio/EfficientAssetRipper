@@ -9,6 +9,7 @@ here so that switching themes only requires calling ``apply()`` once.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
@@ -41,6 +42,56 @@ _DEFAULT_MONO_FAMILY = "Cascadia Code, Consolas, Menlo, monospace"
 FONT_SIZE = "10pt"
 FONT_SIZE_SMALL = "9pt"
 FONT_SIZE_LARGE = "12pt"
+
+
+# ---------------------------------------------------------------------------
+# UI scale
+# ---------------------------------------------------------------------------
+# One global factor scales every px/pt value in the stylesheet plus the
+# proxy-style painted glyphs. Persisted as an integer percent under the
+# `ui_scale` config key; a pending value only takes effect on apply().
+
+UI_SCALE_MIN = 50    # percent
+UI_SCALE_MAX = 200
+UI_SCALE_STEP = 10
+
+_ui_scale: float = 1.0
+
+
+def set_ui_scale(factor: float) -> None:
+    """Set the global UI scale factor (1.0 = 100%). Clamped; takes effect
+    on the next :func:`apply` call."""
+    global _ui_scale
+    _ui_scale = max(UI_SCALE_MIN / 100.0, min(float(factor), UI_SCALE_MAX / 100.0))
+
+
+def ui_scale() -> float:
+    return _ui_scale
+
+
+_SIZE_RE = re.compile(r"(-?\d+(?:\.\d+)?)(px|pt)\b")
+
+
+def _scale_qss(qss: str, s: float) -> str:
+    """Scale every px/pt value in the stylesheet by *s*.
+
+    Post-processing the built QSS keeps the base stylesheet readable at
+    100% and means new rules pick up scaling with no extra plumbing.
+    Non-zero px values never round to zero so hairline borders survive
+    downscaling; font sizes are floored at 6pt to stay legible.
+    """
+    def repl(m: re.Match) -> str:
+        value, unit = float(m.group(1)), m.group(2)
+        scaled = round(value * s)
+        if unit == "pt":
+            scaled = max(6, scaled)
+        elif value > 0:
+            scaled = max(1, scaled)
+        elif value < 0:
+            scaled = min(-1, scaled)
+        return f"{scaled}{unit}"
+
+    return _SIZE_RE.sub(repl, qss)
 
 
 _FONTS_LOADED = False
@@ -220,6 +271,18 @@ def _build_qss(c: dict[str, str]) -> str:
 
 QMainWindow {{
     background-color: {c["bg_dark"]};
+}}
+
+/* Dock-area resize separators. 7px — the separator IS the hit zone, so a
+   hairline makes resizing nearly impossible to grab. */
+QMainWindow::separator {{
+    background-color: {c["bg_dark"]};
+    width: 7px;
+    height: 7px;
+}}
+
+QMainWindow::separator:hover {{
+    background-color: {c["accent"]};
 }}
 
 /* ===== QTabWidget ================================================== */
@@ -481,12 +544,16 @@ QSplitter::handle {{
     margin: 1px;
 }}
 
+QSplitter::handle:hover {{
+    background-color: {c["accent"]};
+}}
+
 QSplitter::handle:horizontal {{
-    width: 3px;
+    width: 6px;
 }}
 
 QSplitter::handle:vertical {{
-    height: 3px;
+    height: 6px;
 }}
 
 /* ===== QScrollBar ================================================== */
@@ -731,10 +798,11 @@ class _BranchCircleStyle(QProxyStyle):
     still cover QSpinBox and friends, which have no QSS rules.
     """
 
-    def __init__(self, accent_color: str, arrow_color: str | None = None, base_style=None):
+    def __init__(self, accent_color: str, arrow_color: str | None = None, base_style=None, scale: float = 1.0):
         super().__init__(base_style)
         self._accent = QColor(accent_color)
         self._arrow = QColor(arrow_color) if arrow_color else QColor(accent_color)
+        self._scale = scale
 
     def drawPrimitive(self, element, option, painter, widget=None):
         if element == QStyle.PrimitiveElement.PE_IndicatorBranch:
@@ -746,9 +814,9 @@ class _BranchCircleStyle(QProxyStyle):
                 r = option.rect
                 cx = float(r.center().x()) + 0.5
                 cy = float(r.center().y()) + 0.5
-                # Triangle: 10 wide × 7 tall, centered in the branch cell
-                hw = 5.0  # half-width
-                hh = 3.5  # half-height
+                # Triangle: 10 wide × 7 tall at 100%, centered in the branch cell
+                hw = 5.0 * self._scale  # half-width
+                hh = 3.5 * self._scale  # half-height
 
                 if is_open:
                     # ▼ down-pointing (expanded)
@@ -784,9 +852,9 @@ class _BranchCircleStyle(QProxyStyle):
             return
         cx = r.center().x() + 0.5
         cy = r.center().y() + 0.5
-        # Triangle 8 wide × 5 tall, scaled down for tiny rects.
-        half_w = min(4.0, r.width() / 2.0)
-        half_h = min(2.5, r.height() / 2.0)
+        # Triangle 8 wide × 5 tall at 100%, scaled down for tiny rects.
+        half_w = min(4.0 * self._scale, r.width() / 2.0)
+        half_h = min(2.5 * self._scale, r.height() / 2.0)
         if direction == "up":
             pts = [
                 QPointF(cx - half_w, cy + half_h),
@@ -813,6 +881,7 @@ class _BranchCircleStyle(QProxyStyle):
 
 _current_scheme_name: str = DEFAULT_SCHEME
 _current_style: "_BranchCircleStyle | None" = None
+_applied_scale: float | None = None
 
 
 def current_scheme() -> dict[str, str]:
@@ -858,8 +927,13 @@ def apply(app: QApplication, scheme_name: str | None = None) -> None:
     Loads custom fonts from the fonts/ directory on first call.
     No-ops if the requested scheme is already active.
     """
-    global _current_scheme_name, _current_style
-    if scheme_name and scheme_name == _current_scheme_name and _current_style is not None:
+    global _current_scheme_name, _current_style, _applied_scale
+    if (
+        scheme_name
+        and scheme_name == _current_scheme_name
+        and _current_style is not None
+        and _applied_scale == _ui_scale
+    ):
         # Already applied — nothing to do, avoid stylesheet thrash.
         return
     if scheme_name:
@@ -874,6 +948,7 @@ def apply(app: QApplication, scheme_name: str | None = None) -> None:
         c["accent"],
         arrow_color=c["text_secondary"],
         base_style="Fusion",
+        scale=_ui_scale,
     )
     new_style.setParent(app)      # prevent GC
     app.setStyle(new_style)
@@ -881,4 +956,8 @@ def apply(app: QApplication, scheme_name: str | None = None) -> None:
     # here so the old QProxyStyle isn't kept alive past Qt's lifetime.
     _current_style = new_style
     app.setPalette(_build_palette(c))
-    app.setStyleSheet(_build_qss(c))
+    qss = _build_qss(c)
+    if _ui_scale != 1.0:
+        qss = _scale_qss(qss, _ui_scale)
+    app.setStyleSheet(qss)
+    _applied_scale = _ui_scale

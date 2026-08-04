@@ -435,3 +435,55 @@ def test_types_scan_batch_final_emits_done_with_counts(unpacker_with_stub, qtbot
     with qtbot.waitSignal(up.types_scan_done, timeout=1000) as done_sig:
         proc.feed(json.dumps(payload))
     assert done_sig.args == [3, 4200]
+
+
+# ---------------------------------------------------------------------------
+# FMOD bank scan / export
+# ---------------------------------------------------------------------------
+
+def test_scan_fmod_banks_command_writes_correct_ndjson(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.scan_fmod_banks()
+    assert proc.write_log
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload == {"cmd": "scan_fmod_banks"}
+
+
+def test_export_fmod_audio_command_writes_correct_ndjson(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    entries = [{
+        "bank_vfs_path": "Game/Content/FMOD/Desktop/SFX.bank",
+        "stream_index": 3,
+        "target_name": "0003_footstep",
+        "target_folder": "Game/Content/FMOD/Desktop/SFX",
+    }]
+    up.export_fmod_audio(entries, "C:/out")
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload == {
+        "cmd": "export_fmod_audio",
+        "output_dir": "C:/out",
+        "entries": entries,
+    }
+
+
+def test_fmod_scan_result_signal(unpacker_with_stub, qtbot):
+    up, proc = unpacker_with_stub
+    payload = {
+        "type": "fmod_scan_result",
+        "found": True,
+        "total_banks": 1,
+        "total_streams": 2,
+        "banks": [{
+            "bank_vfs_path": "Game/Content/FMOD/Desktop/SFX.bank",
+            "bank_name": "SFX.bank",
+            "streams": [
+                {"index": 1, "name": "jump", "sample_rate": 48000, "duration_ms": 500},
+                {"index": 2, "name": "", "sample_rate": 44100, "duration_ms": 1200},
+            ],
+        }],
+    }
+    with qtbot.waitSignal(up.fmod_scan_result, timeout=1000) as sig:
+        proc.feed(json.dumps(payload))
+    result = sig.args[0]
+    assert result["found"] is True
+    assert result["banks"][0]["streams"][0]["name"] == "jump"

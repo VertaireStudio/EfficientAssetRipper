@@ -391,6 +391,15 @@ class MainWindow(QMainWindow):
         # row/column per area and additional drops get tabified instead.
         self.setDockNestingEnabled(True)
 
+        # GroupedDragging is what enables dragging a single tab OUT of a
+        # tabbed dock group — Qt gates the tab-bar drag path on this dock
+        # option, not on DockWidgetFloatable. Docks stay non-floatable, so
+        # a drop outside any dock area re-plugs the dock instead of
+        # detaching it as an OS window.
+        self.setDockOptions(
+            self.dockOptions() | QMainWindow.DockOption.GroupedDragging
+        )
+
         self._apply_default_dock_layout()
         # Snapshot the default layout *once*, immediately after building it.
         # Reset Layout calls restoreState(...) with this blob instead of

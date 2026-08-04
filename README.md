@@ -46,6 +46,7 @@ trademarks of Epic Games, Inc. in the United States and elsewhere.
 - **Batch Queue** — Multi-asset processing with progress tracking, logging, and cancellation
 - **Texture Preset System** — Configurable texture slot rules (suffixes, parameter names, wiring types) with per-material overrides
 - **WWise Audio Support** — Scans AkAudioEvent assets, extracts WEM files, and converts to WAV/OGG via vgmstream
+- **FMOD Audio Support** — Scans FMOD Studio `.bank` files (packed or loose on disk), lists every stream by name under the bank in the tree, and previews/exports them as WAV via vgmstream
 - **Blend Combiner** — Merge multiple `.blend` files into a single scene with grid layout
 - **Multi-Profile** — Per-game configuration profiles (game paths, AES keys, UE version, export directories)
 - **Themeable UI** — 4 built-in color schemes + custom scheme editor with PySide6/Qt6
@@ -413,6 +414,7 @@ The built-in CLI tool communicates via NDJSON (newline-delimited JSON) over stdi
 - **Asset export**: Static/Skeletal Meshes (PSK/PSKX), Textures (PNG/TGA), Animations (PSA), Audio (WAV/OGG)
 - **Material property serialization** to JSON
 - **WWise audio** event scanning and WEM export with automatic naming
+- **FMOD audio** bank scanning with per-stream preview and WAV export
 - **Oodle decompression** (auto-downloads if needed)
 - **vgmstream integration** for WEM→WAV/OGG conversion
 
@@ -467,7 +469,7 @@ projects — please support them:
   meshes and assembles material graphs.
 - **[io_scene_psk_psa](https://github.com/DarklightGames/io_scene_psk_psa)** —
   the bundled Blender extension that imports PSK/PSKX/PSA files.
-- **[vgmstream](https://vgmstream.org/)** — game audio decoding for WWise WEM
+- **[vgmstream](https://vgmstream.org/)** — game audio decoding for WWise WEM and FMOD banks
   conversion.
 - **[Oodle](http://www.radgametools.com/oodlecompressors.htm)** by Epic Games /
   RAD Game Tools — the compression codec used by most modern UE games

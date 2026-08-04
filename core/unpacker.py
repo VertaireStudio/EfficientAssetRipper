@@ -36,6 +36,7 @@ class UnpackerProcess(QObject):
     props_result = Signal(str, list)          # path, list[dict{name, export_type, properties}]
     exports_listed = Signal(str, list, str)   # path, list[dict{name, export_type, outer}], error ("" if none)
     wwise_scan_result = Signal(dict)          # full scan result dict
+    fmod_scan_result = Signal(dict)           # full FMOD bank scan result dict
     types_scan_progress = Signal(int, int)    # current, total
     types_scan_batch = Signal(list, bool)     # entries, is_final
     types_scan_done = Signal(int, int)        # error_count, total_packages
@@ -169,6 +170,22 @@ class UnpackerProcess(QObject):
     def scan_wwise_events(self) -> None:
         """Scan AkAudioEvent assets in WWiseAudio/Events for media mappings."""
         self._send({"cmd": "scan_wwise_events"})
+
+    def scan_fmod_banks(self) -> None:
+        """Scan FMOD .bank files (VFS + loose) for playable streams."""
+        self._send({"cmd": "scan_fmod_banks"})
+
+    def export_fmod_audio(self, entries: list[dict], output_dir: str) -> None:
+        """Export individual FMOD bank streams to WAV.
+
+        Each entry carries ``bank_vfs_path``, ``stream_index`` (1-based,
+        vgmstream subsong numbering), ``target_name`` and ``target_folder``.
+        """
+        self._send({
+            "cmd": "export_fmod_audio",
+            "output_dir": output_dir,
+            "entries": entries,
+        })
 
     def scan_types(self) -> None:
         """Bulk-scan every package's export types for the type cache.
@@ -315,6 +332,9 @@ class UnpackerProcess(QObject):
 
         elif msg_type == "wwise_scan_result":
             self.wwise_scan_result.emit(msg)
+
+        elif msg_type == "fmod_scan_result":
+            self.fmod_scan_result.emit(msg)
 
         elif msg_type == "types_scan_progress":
             self.types_scan_progress.emit(

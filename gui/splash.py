@@ -1,15 +1,20 @@
-"""Animated splash screen for EfficientAssetRipper.
+"""Animated splash overlay for EfficientAssetRipper.
 
 Sequence
 --------
-1. Logo gem spins up from the bottom of the screen
+1. Logo gem spins up from the bottom
 2. Circle grows around the logo
-3. Logo + circle scale up rapidly to fill the screen
-4. A rectangle opens from the centre, revealing the main window
+3. Logo + circle hold for a beat
+4. Circle accelerates outward in one motion, squaring into a
+   rectangle that covers the window
+5. The whole cover slides up and off, revealing the UI
 
-The splash is a frameless, translucent overlay that paints everything
-itself.  It calls ``finish_callback`` when the animation completes so
-the caller can raise/activate the real window underneath.
+The splash is a *child widget* of the main window, not a separate OS
+window. A single toplevel means Windows never has to swap between two
+surfaces when the animation ends — closing a second stay-on-top window
+sometimes left a frame of desktop visible, which looked like the app
+closing and relaunching. Unpainted regions of the overlay show the UI
+underneath, which is what makes the final slide-away reveal work.
 
 Progress is driven by ``QElapsedTimer`` (real wall-clock time) on a
 fixed-interval ``QTimer``. If the GUI thread stutters and frames drop,
@@ -24,8 +29,8 @@ from typing import Callable
 
 from PySide6.QtCore import (
     QElapsedTimer,
+    QEvent,
     QPointF,
-    QRect,
     QRectF,
     Qt,
     QTimer,
@@ -36,35 +41,43 @@ from PySide6.QtGui import (
     QFont,
     QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QPolygonF,
 )
 from PySide6.QtWidgets import QWidget
 
 from _version import __version__
-from gui.color_schemes import get_scheme, DEFAULT_SCHEME
+from gui.color_schemes import get_scheme
+import gui.theme as theme
 
 
 # ---------------------------------------------------------------------------
 # Animation phases encoded as a single 0‒1 float (``progress``)
 #
-#   0.00 – 0.30  Logo rise + spin
-#   0.30 – 0.50  Circle grows around logo
-#   0.50 – 0.70  Scale-up (logo + circle rush towards viewer)
-#   0.70 – 1.00  Rectangle iris-open revealing the window
+#   0.00 – 0.41  Logo rise + spin                 (1000 ms)
+#   0.41 – 0.53  Circle grows around logo         (300 ms)
+#   0.53 – 0.67  Hold on logo + circle            (350 ms)
+#   0.67 – 0.84  Circle accelerates out to cover, squaring into a rectangle
+#   0.84 – 1.00  Cover slides up, revealing the UI
 # ---------------------------------------------------------------------------
 
-_PHASE_RISE_END = 0.30
-_PHASE_CIRCLE_END = 0.50
-_PHASE_ZOOM_END = 0.70
-_PHASE_IRIS_END = 1.00
+_PHASE_RISE_END = 0.41
+_PHASE_CIRCLE_END = 0.53
+_PHASE_HOLD_END = 0.67
+_PHASE_EXPAND_END = 0.84
+_PHASE_SLIDE_END = 1.00
 
-_DURATION_MS = 1800            # total animation length
+_DURATION_MS = 2450            # total animation length
 _FRAME_INTERVAL_MS = 16        # ~60 FPS target
 
 
 def _ease_out_cubic(t: float) -> float:
     return 1.0 - (1.0 - t) ** 3
+
+
+def _ease_in_cubic(t: float) -> float:
+    return t ** 3
 
 
 def _ease_in_out(t: float) -> float:
@@ -79,28 +92,20 @@ def _lerp(a: float, b: float, t: float) -> float:
 
 
 class SplashScreen(QWidget):
-    """Animated splash overlay sized to the main window area."""
+    """Animated overlay covering the main window's client area."""
 
-    def __init__(self, finish_callback: Callable[[], None], target_rect: QRect | None = None, scheme_name: str | None = None, parent=None):
+    def __init__(
+        self,
+        parent: QWidget,
+        finish_callback: Callable[[], None] | None = None,
+        scheme_name: str | None = None,
+    ):
         super().__init__(parent)
-        self._target_rect = target_rect
         self._finish_cb = finish_callback
-        self._colors = get_scheme(scheme_name or DEFAULT_SCHEME)
+        # Match the applied theme so the cover blends into the revealed UI.
+        self._colors = get_scheme(scheme_name) if scheme_name else theme.current_scheme()
 
-        # Frameless + stays-on-top, translucent so the iris phase reveals the
-        # main window underneath. No `Qt.Tool` — that flag tells Windows to
-        # treat this as a secondary window that doesn't carry focus, which
-        # leaves the real main window stranded in the back of the z-order
-        # when the splash closes.
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        # Don't steal focus when shown — the main window underneath should
-        # remain the active window for keyboard/Alt-Tab purposes.
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self._progress = 0.0       # 0→1 drives the whole sequence
@@ -118,12 +123,13 @@ class SplashScreen(QWidget):
     # ------------------------------------------------------------------
 
     def start(self):
-        """Show over the main window area and kick off the animation."""
-        if self._target_rect is not None:
-            self.setGeometry(self._target_rect)
-            self.show()
-        else:
-            self.showFullScreen()
+        """Cover the parent window and kick off the animation."""
+        parent = self.parentWidget()
+        self.setGeometry(parent.rect())
+        # Track parent resizes (e.g. a maximized saved layout realising
+        # after show) so the cover never leaves an uncovered strip.
+        parent.installEventFilter(self)
+        self.show()
         self.raise_()
         self._elapsed.start()
         self._tick.start()
@@ -131,6 +137,11 @@ class SplashScreen(QWidget):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def eventFilter(self, obj, event):
+        if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self.setGeometry(self.parentWidget().rect())
+        return False
 
     def _on_tick(self):
         # Recompute progress from elapsed wall-clock time. Frame drops just
@@ -147,12 +158,16 @@ class SplashScreen(QWidget):
         if self._finished:
             return
         self._finished = True
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.removeEventFilter(self)
         try:
-            self._finish_cb()
+            if self._finish_cb is not None:
+                self._finish_cb()
         finally:
             # Always close the splash, even if the callback raises;
-            # leaving an invisible WindowStaysOnTop overlay around blocks
-            # input on the main window.
+            # leaving an invisible overlay around blocks input on the
+            # widgets underneath.
             self.close()
 
     # ------------------------------------------------------------------
@@ -169,87 +184,82 @@ class SplashScreen(QWidget):
         t = self._progress
 
         c = self._colors
+        gem_size = min(W, H) * 0.08
+        ring_r = gem_size * 2.5
 
-        # ── Phase 4: Iris rectangle open ─────────────────────────────
-        # In the iris phase we paint a translucent "curtain" everywhere
-        # except the growing centre rect, fading the curtain out so the
-        # main window underneath shows through. We compute the cutout
-        # rect first because phases 1-3 only need a solid background.
-        if t >= _PHASE_ZOOM_END:
-            iris_t = _ease_in_out((t - _PHASE_ZOOM_END) / (_PHASE_IRIS_END - _PHASE_ZOOM_END))
-            half_w = _lerp(0, W / 2, iris_t)
-            half_h = _lerp(0, H / 2, iris_t)
-            curtain_alpha = int(_lerp(255, 0, iris_t))
-
-            curtain = QColor(c["bg_darkest"])
-            curtain.setAlpha(curtain_alpha)
-
-            # Four-rect curtain (top/bottom/left/right of the cutout) is
-            # ~20× cheaper than QPainterPath subtraction and gives the
-            # same visual result.
-            top_h = cy - half_h
-            bot_y = cy + half_h
-            left_w = cx - half_w
-            right_x = cx + half_w
-            mid_h = half_h * 2
-
-            if top_h > 0:
-                p.fillRect(QRectF(0, 0, W, top_h), curtain)
-            if bot_y < H:
-                p.fillRect(QRectF(0, bot_y, W, H - bot_y), curtain)
-            if left_w > 0:
-                p.fillRect(QRectF(0, cy - half_h, left_w, mid_h), curtain)
-            if right_x < W:
-                p.fillRect(QRectF(right_x, cy - half_h, W - right_x, mid_h), curtain)
-
-            # Subtle border on the opening
-            if iris_t < 0.95:
-                border_color = QColor(c["accent"])
-                border_color.setAlpha(int(_lerp(180, 0, iris_t)))
-                p.setPen(QPen(border_color, 2))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                rect = QRectF(cx - half_w, cy - half_h, half_w * 2, half_h * 2)
-                radius = 10 * (1 - iris_t)
-                p.drawRoundedRect(rect, radius, radius)
-
+        # ── Phase 5: slide the whole cover up and off ────────────────
+        # Everything below the translated cover is simply not painted,
+        # so the main window shows through — the reveal *is* the slide.
+        if t >= _PHASE_EXPAND_END:
+            slide_t = _ease_out_cubic((t - _PHASE_EXPAND_END) / (_PHASE_SLIDE_END - _PHASE_EXPAND_END))
+            p.translate(0, -slide_t * H)
+            p.fillRect(QRectF(0, 0, W, H), QColor(c["bg_dark"]))
+            self._draw_gem(p, cx, cy, gem_size, spin_deg=0.0)
+            self._draw_footer(p, W, H, alpha=200)
             p.end()
             return
 
-        # ── Phases 1-3: opaque background + gem + ring ───────────────
-        bg = QColor(c["bg_darkest"])
-        p.fillRect(0, 0, int(W), int(H), bg)
+        # ── Phases 1-4: backdrop + gem + circle/bar ──────────────────
+        p.fillRect(QRectF(0, 0, W, H), QColor(c["bg_darkest"]))
 
         rise_t = _ease_out_cubic(min(t / _PHASE_RISE_END, 1.0))
-
         logo_y = _lerp(H * 0.85, cy, rise_t)
-        logo_x = cx
         spin_deg = rise_t * 360.0
 
-        if t > _PHASE_CIRCLE_END:
-            zoom_t = _ease_in_out((t - _PHASE_CIRCLE_END) / (_PHASE_ZOOM_END - _PHASE_CIRCLE_END))
-            gem_scale = _lerp(1.0, max(W, H) / 40, zoom_t)
-        else:
-            gem_scale = 1.0
-
-        base_gem_size = min(W, H) * 0.08
-
-        circle_alpha = 0
-        circle_radius = 0.0
+        # One continuous shape morph: a centred rounded rect that starts as
+        # the circle (radius == both half-extents) and expands toward every
+        # screen edge at once while its corner radius shrinks to zero — so
+        # it squares into a rectangle as it grows.
         if t >= _PHASE_RISE_END:
-            circ_t = _ease_out_cubic(min((t - _PHASE_RISE_END) / (_PHASE_CIRCLE_END - _PHASE_RISE_END), 1.0))
-            circle_radius = _lerp(0, base_gem_size * 2.5, circ_t) * gem_scale
-            circle_alpha = int(_lerp(0, 200, circ_t))
-            if t > _PHASE_CIRCLE_END:
-                circle_alpha = 200
+            if t < _PHASE_CIRCLE_END:
+                grow_t = _ease_out_cubic((t - _PHASE_RISE_END) / (_PHASE_CIRCLE_END - _PHASE_RISE_END))
+                half_w = half_h = _lerp(0, ring_r, grow_t)
+                radius = half_h
+                alpha = int(_lerp(0, 200, grow_t))
+            elif t < _PHASE_HOLD_END:
+                half_w = half_h = radius = ring_r
+                alpha = 200
+            else:
+                # Ease-in: starts from the held pose at rest and accelerates
+                # outward; the slide phase's ease-out then carries the
+                # momentum through to the reveal.
+                expand_t = _ease_in_cubic((t - _PHASE_HOLD_END) / (_PHASE_EXPAND_END - _PHASE_HOLD_END))
+                half_w = _lerp(ring_r, W / 2 + gem_size, expand_t)
+                half_h = _lerp(ring_r, H / 2 + gem_size, expand_t)
+                radius = _lerp(ring_r, 0.0, expand_t)
+                alpha = 200
 
-        # Gem
+            if half_w > 0 and half_h > 0:
+                rect = QRectF(cx - half_w, cy - half_h, half_w * 2, half_h * 2)
+
+                fill = QColor(c["bg_dark"])
+                fill.setAlpha(int(alpha * 255 / 200))
+                edge = QColor(c["accent"])
+                edge.setAlpha(alpha)
+                glow = QColor(c["accent"])
+                glow.setAlpha(alpha // 3)
+
+                p.setPen(QPen(glow, max(4.0, gem_size * 0.18)))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                g = gem_size * 0.08
+                p.drawRoundedRect(rect.adjusted(-g, -g, g, g), radius + g, radius + g)
+
+                p.setPen(QPen(edge, max(2.0, gem_size * 0.08)))
+                p.setBrush(QBrush(fill))
+                p.drawRoundedRect(rect, radius, radius)
+
+        self._draw_gem(p, cx, logo_y, gem_size, spin_deg)
+        self._draw_footer(p, W, H, alpha=int(_lerp(0, 200, min(t / _PHASE_RISE_END, 1.0))))
+        p.end()
+
+    def _draw_gem(self, p: QPainter, x: float, y: float, size: float, spin_deg: float):
+        c = self._colors
         p.save()
-        p.translate(logo_x, logo_y)
+        p.translate(x, y)
         p.rotate(spin_deg)
-        p.scale(gem_scale, gem_scale)
 
-        dh = base_gem_size * 0.9
-        dw = base_gem_size * 0.65
+        dh = size * 0.9
+        dw = size * 0.65
 
         gem = QPolygonF([
             QPointF(0, -dh),
@@ -266,34 +276,28 @@ class SplashScreen(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.drawPolygon(gem)
 
-        facet_pen = QPen(QColor(255, 255, 255, 180), max(1.0, base_gem_size * 0.04))
-        p.setPen(facet_pen)
-        p.drawLine(QPointF(0, -dh), QPointF(dw, 0))
-        p.drawLine(QPointF(0, -dh), QPointF(-dw * 0.55, -dh * 0.25))
-        facet_pen.setColor(QColor(255, 255, 255, 70))
-        p.setPen(facet_pen)
+        # Facet lines are clipped to the silhouette so stroke width never
+        # pokes past the gem's edges.
+        clip = QPainterPath()
+        clip.addPolygon(gem)
+        clip.closeSubpath()
+        p.save()
+        p.setClipPath(clip)
+        lw = max(1.0, size * 0.04)
+        p.setPen(QPen(QColor(255, 255, 255, 170), lw))
+        p.drawLine(QPointF(0, -dh), QPointF(-dw * 0.5, 0))
+        p.drawLine(QPointF(0, -dh), QPointF(dw * 0.5, 0))
+        p.setPen(QPen(QColor(255, 255, 255, 70), lw * 0.8))
         p.drawLine(QPointF(-dw, 0), QPointF(dw, 0))
+        p.drawLine(QPointF(0, dh), QPointF(-dw * 0.5, 0))
+        p.drawLine(QPointF(0, dh), QPointF(dw * 0.5, 0))
+        p.restore()
 
         p.restore()
 
-        # Ring
-        if circle_radius > 0 and circle_alpha > 0:
-            ring_color = QColor(c["accent"])
-            ring_color.setAlpha(circle_alpha)
-            ring_pen = QPen(ring_color, max(2.0, base_gem_size * 0.08 * gem_scale))
-            p.setPen(ring_pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(logo_x, logo_y), circle_radius, circle_radius)
-
-            glow = QColor(c["accent"])
-            glow.setAlpha(max(0, circle_alpha // 3))
-            glow_pen = QPen(glow, max(4.0, base_gem_size * 0.18 * gem_scale))
-            p.setPen(glow_pen)
-            p.drawEllipse(QPointF(logo_x, logo_y), circle_radius * 1.08, circle_radius * 1.08)
-
-        # Footer
-        footer = QColor(c["text_secondary"])
-        footer.setAlpha(int(_lerp(0, 200, min(t / _PHASE_RISE_END, 1.0))))
+    def _draw_footer(self, p: QPainter, W: float, H: float, alpha: int):
+        footer = QColor(self._colors["text_secondary"])
+        footer.setAlpha(alpha)
         font = QFont()
         font.setPointSizeF(max(8.0, min(W, H) * 0.012))
         p.setFont(font)
@@ -303,5 +307,3 @@ class SplashScreen(QWidget):
             int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
             f"EfficientAssetRipper v{__version__}",
         )
-
-        p.end()

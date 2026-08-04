@@ -102,6 +102,13 @@ def test_docks_are_not_floatable(main_window):
         )
 
 
+def test_grouped_dragging_enabled(main_window):
+    """Qt only allows dragging a tab out of a tabbed dock group when the
+    GroupedDragging dock option is set — without it tab drags are ignored."""
+    from PySide6.QtWidgets import QMainWindow
+    assert bool(main_window.dockOptions() & QMainWindow.DockOption.GroupedDragging)
+
+
 def test_is_busy_false_initially(main_window):
     assert main_window._is_busy() is False
 

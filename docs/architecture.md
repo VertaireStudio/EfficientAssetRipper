@@ -54,10 +54,11 @@ Two big subsystems live in one repo:
    wraps it as a `QObject` with signals. Every line is one JSON object.
    - Commands: `init`, `browse`, `export`, `export_folder`, `cancel`,
      `get_props`, `scan_wwise_events`, `list_exports`, `export_wwise_audio`,
-     `quit`.
+     `scan_fmod_banks`, `export_fmod_audio`, `quit`.
    - Reply types: `init_done`, `browse_result`, `progress`, `export_done`,
-     `props_result`, `exports_listed`, `wwise_scan_result`, `warning`,
-     `version_warning`, `error`, `cancelled`, `quit_ack`.
+     `props_result`, `exports_listed`, `wwise_scan_result`,
+     `fmod_scan_result`, `warning`, `version_warning`, `error`,
+     `cancelled`, `quit_ack`.
 5. **Asset resolution is suffix-driven, not path-driven.**
    [core/texture_resolver.py](../core/texture_resolver.py) classifies
    textures by suffix (`_C`, `_N`, `_ORM`, …) first, then `param_names`

@@ -53,11 +53,13 @@ internal static class Program
     private static Dictionary<string, string> _looseFiles = new(StringComparer.OrdinalIgnoreCase); // VFS path → disk path for files CUE4Parse doesn't discover
     private static string? _vgmstreamPath;         // cached path to vgmstream-cli.exe
     private static Dictionary<string, string> _wemIdToName = new(StringComparer.OrdinalIgnoreCase); // WEM numeric ID → debug name
+    private static Dictionary<string, string> _fmodBankCache = new(StringComparer.OrdinalIgnoreCase); // bank VFS path → materialized temp file
     private static string? _wemNameCachePath;       // per-game disk cache for WEM name map
     private static bool _wemMapBuilt;               // true once the map has been built/loaded this session
     private static Task? _exportTask;               // currently running export (if any)
     private static Task<string?>? _pendingReadTask;   // parked stdin read from RunExportWithCancelSupport
     private static readonly Queue<JObject> _pendingGetProps = new(); // get_props commands queued during export
+    private static readonly Queue<JObject> _pendingCommands = new(); // whole-export commands queued during a concurrent export/scan
     private static readonly object _respondLock = new(); // guards stdout writes during concurrent export
 
     // Version-mismatch hint: when a stream of warnings/errors look like the UE
@@ -264,6 +266,7 @@ internal static class Program
             Console.WriteLine("Commands: init, browse, export, export_folder, inspect,");
             Console.WriteLine("          list_exports, get_props, scan_wwise_events,");
             Console.WriteLine("          scan_types, export_wwise_audio, export_video,");
+            Console.WriteLine("          scan_fmod_banks, export_fmod_audio,");
             Console.WriteLine("          rebuild_wem_cache, cancel, quit");
             return;
         }
@@ -304,6 +307,22 @@ internal static class Program
         var reader = new StreamReader(Console.OpenStandardInput());
         while (true)
         {
+            // Drain commands that arrived during an export/scan and were
+            // queued by RunExportWithCancelSupport rather than dropped.
+            if (_pendingCommands.Count > 0)
+            {
+                var queued = _pendingCommands.Dequeue();
+                try
+                {
+                    if (!await DispatchCommand(queued, reader)) return;
+                }
+                catch (Exception ex)
+                {
+                    RespondError(SanitizeMessage(ex.Message));
+                }
+                continue;
+            }
+
             // Consume any parked read left by RunExportWithCancelSupport
             string? line;
             if (_pendingReadTask != null)
@@ -320,66 +339,79 @@ internal static class Program
             try
             {
                 var cmd = JObject.Parse(line);
-                var cmdName = cmd.Value<string>("cmd") ?? "";
-                switch (cmdName)
-                {
-                    case "init":
-                        HandleInit(cmd);
-                        break;
-                    case "browse":
-                        HandleBrowse(cmd);
-                        break;
-                    case "detect_ue_version":
-                        HandleDetectUeVersion(cmd);
-                        break;
-                    case "export":
-                        await RunExportWithCancelSupport(reader, () => HandleExport(cmd));
-                        break;
-                    case "export_folder":
-                        await RunExportWithCancelSupport(reader, () => HandleExportFolder(cmd));
-                        break;
-                    case "inspect":
-                        HandleInspect(cmd);
-                        break;
-                    case "list_exports":
-                        await RunExportWithCancelSupport(reader, () => HandleListExports(cmd));
-                        break;
-                    case "get_props":
-                        HandleGetProps(cmd);
-                        break;
-                    case "rebuild_wem_cache":
-                        HandleRebuildWemCache();
-                        break;
-                    case "scan_wwise_events":
-                        await RunExportWithCancelSupport(reader, () => HandleScanWwiseEvents(cmd));
-                        break;
-                    case "scan_types":
-                        await RunExportWithCancelSupport(reader, () => HandleScanTypes(cmd));
-                        break;
-                    case "export_wwise_audio":
-                        await RunExportWithCancelSupport(reader, () => HandleExportWwiseAudio(cmd));
-                        break;
-                    case "export_video":
-                        await RunExportWithCancelSupport(reader, () => HandleExportVideo(cmd));
-                        break;
-                    case "cancel":
-                        _cts.Cancel();
-                        _cts = new CancellationTokenSource();
-                        Respond(new { type = "cancelled" });
-                        break;
-                    case "quit":
-                        Respond(new { type = "quit_ack" });
-                        return;
-                    default:
-                        RespondError($"Unknown command: {cmdName}");
-                        break;
-                }
+                if (!await DispatchCommand(cmd, reader)) return;
             }
             catch (Exception ex)
             {
                 RespondError(SanitizeMessage(ex.Message));
             }
         }
+    }
+
+    /// <summary>Route one command object. Returns false when the loop should exit (quit).</summary>
+    private static async Task<bool> DispatchCommand(JObject cmd, StreamReader reader)
+    {
+        var cmdName = cmd.Value<string>("cmd") ?? "";
+        switch (cmdName)
+        {
+            case "init":
+                HandleInit(cmd);
+                break;
+            case "browse":
+                HandleBrowse(cmd);
+                break;
+            case "detect_ue_version":
+                HandleDetectUeVersion(cmd);
+                break;
+            case "export":
+                await RunExportWithCancelSupport(reader, () => HandleExport(cmd));
+                break;
+            case "export_folder":
+                await RunExportWithCancelSupport(reader, () => HandleExportFolder(cmd));
+                break;
+            case "inspect":
+                HandleInspect(cmd);
+                break;
+            case "list_exports":
+                await RunExportWithCancelSupport(reader, () => HandleListExports(cmd));
+                break;
+            case "get_props":
+                HandleGetProps(cmd);
+                break;
+            case "rebuild_wem_cache":
+                HandleRebuildWemCache();
+                break;
+            case "scan_wwise_events":
+                await RunExportWithCancelSupport(reader, () => HandleScanWwiseEvents(cmd));
+                break;
+            case "scan_types":
+                await RunExportWithCancelSupport(reader, () => HandleScanTypes(cmd));
+                break;
+            case "export_wwise_audio":
+                await RunExportWithCancelSupport(reader, () => HandleExportWwiseAudio(cmd));
+                break;
+            case "scan_fmod_banks":
+                await RunExportWithCancelSupport(reader, () => HandleScanFmodBanks(cmd));
+                break;
+            case "export_fmod_audio":
+                await RunExportWithCancelSupport(reader, () => HandleExportFmodAudio(cmd));
+                break;
+            case "export_video":
+                await RunExportWithCancelSupport(reader, () => HandleExportVideo(cmd));
+                break;
+            case "cancel":
+                _cts.Cancel();
+                _cts = new CancellationTokenSource();
+                Respond(new { type = "cancelled" });
+                break;
+            case "quit":
+                Respond(new { type = "quit_ack" });
+                return false;
+            default:
+                RespondError($"Unknown command: {cmdName}");
+                break;
+        }
+        return true;
     }
 
     /// <summary>
@@ -499,7 +531,11 @@ internal static class Program
                         HandleScanTypes(subCmd);
                         break;
                     default:
-                        break; // Other commands wait until export finishes
+                        // Whole-export commands (exports, audio scans) can't run
+                        // concurrently — queue them for the main loop to run
+                        // after this one completes, never silently drop them.
+                        _pendingCommands.Enqueue(subCmd);
+                        break;
                 }
             }
             catch (OperationCanceledException) { /* swallow — already emitted cancelled */ }
@@ -733,11 +769,14 @@ internal static class Program
         catch { /* older CUE4Parse — fall back to count-only */ }
 
         // Scan for loose files that CUE4Parse doesn't natively discover
-        // (.upk, .wem, .ewem, .bnk — common in UE3 games like pre-F2P Rocket League)
+        // (.upk, .wem, .ewem, .bnk — common in UE3 games like pre-F2P Rocket
+        // League; .bank — FMOD Studio banks, which the FMOD UE plugin loads
+        // from disk outside the pak)
         _gameDir = gameDir;
         _looseFiles.Clear();
+        _fmodBankCache.Clear();
         var looseExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { ".upk", ".wem", ".ewem", ".bnk" };
+            { ".upk", ".wem", ".ewem", ".bnk", ".bank" };
         var gameDirInfo = new DirectoryInfo(gameDir);
         if (gameDirInfo.Exists)
         {
@@ -1009,6 +1048,7 @@ internal static class Program
         if (lower.EndsWith(".wem")) return "Audio";
         if (lower.EndsWith(".ewem")) return "EncryptedAudio";
         if (lower.EndsWith(".bnk")) return "SoundBank";
+        if (lower.EndsWith(".bank")) return "FmodBank";
         if (lower.EndsWith(".ubulk")) return "BulkData";
         if (lower.EndsWith(".umap")) return "Map";
         if (lower.EndsWith(".upk")) return "UE3Package";
@@ -2466,6 +2506,292 @@ internal static class Program
 
         Respond(new { type = "export_done", succeeded, failed, total = entries.Count });
         return Task.CompletedTask;
+    }
+
+    // ─── FMOD Studio banks (scan + export via vgmstream) ──────────────
+
+    /// <summary>
+    /// Resolve a .bank to a file on disk vgmstream can open. Loose banks are
+    /// used in place; VFS-packed banks are extracted once per session into a
+    /// temp cache (cleared on init).
+    /// </summary>
+    private static string? GetFmodBankLocalPath(string vfsPath, out string? error)
+    {
+        error = null;
+        if (_looseFiles.TryGetValue(vfsPath, out var diskPath) && File.Exists(diskPath))
+            return diskPath;
+        if (_fmodBankCache.TryGetValue(vfsPath, out var cached) && File.Exists(cached))
+            return cached;
+
+        if (_provider == null || !_provider.TrySaveAsset(vfsPath, out var data) || data == null)
+        {
+            error = "Bank not found in VFS";
+            return null;
+        }
+
+        var cacheDir = Path.Combine(Path.GetTempPath(), "CUE4ParseCLI_fmod");
+        Directory.CreateDirectory(cacheDir);
+        // Hash prefix keeps same-named banks from different folders apart.
+        var hash = ComputeSha256Hex(System.Text.Encoding.UTF8.GetBytes(vfsPath))[..16];
+        var name = SanitizeName(Path.GetFileName(vfsPath));
+        if (string.IsNullOrEmpty(name)) name = "bank.bank";
+        var tempPath = Path.Combine(cacheDir, $"{hash}_{name}");
+        File.WriteAllBytes(tempPath, data);
+        _fmodBankCache[vfsPath] = tempPath;
+        return tempPath;
+    }
+
+    /// <summary>Run vgmstream-cli with captured stdout. Null if it couldn't run.</summary>
+    private static (int ExitCode, string Stdout)? RunVgmstreamCapture(IEnumerable<string> args, int timeoutMs)
+    {
+        InitVgmstream();
+        if (_vgmstreamPath == null) return null;
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = _vgmstreamPath,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+
+        try
+        {
+            using var proc = Process.Start(psi);
+            if (proc == null) return null;
+            // Drain both pipes concurrently — a blocked stderr pipe would
+            // deadlock a sequential ReadToEnd on stdout.
+            var soTask = proc.StandardOutput.ReadToEndAsync();
+            var seTask = proc.StandardError.ReadToEndAsync();
+            if (!proc.WaitForExit(timeoutMs))
+            {
+                try { proc.Kill(); } catch { }
+                return null;
+            }
+            return (proc.ExitCode, soTask.GetAwaiter().GetResult());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Probe every subsong in a bank via `vgmstream-cli -m -I -S 0`; one JSON
+    /// object per subsong. Falls back to per-subsong probes if the batched
+    /// form only reported the first stream.
+    /// </summary>
+    private static List<JObject> ProbeFmodBank(string localPath)
+    {
+        var result = new List<JObject>();
+        var run = RunVgmstreamCapture(new[] { "-m", "-I", "-S", "0", localPath }, 120_000);
+        if (run == null) return result;
+        result.AddRange(ParseJsonObjects(run.Value.Stdout));
+
+        if (result.Count == 1)
+        {
+            var totalSubsongs = result[0].SelectToken("streamInfo.total")?.Value<int>() ?? 1;
+            for (int i = 2; i <= totalSubsongs; i++)
+            {
+                if (_cts.Token.IsCancellationRequested) break;
+                var sub = RunVgmstreamCapture(new[] { "-m", "-I", "-s", i.ToString(), localPath }, 30_000);
+                if (sub == null) break;
+                var objs = ParseJsonObjects(sub.Value.Stdout);
+                if (objs.Count == 0) break;
+                result.Add(objs[0]);
+            }
+        }
+        return result;
+    }
+
+    private static List<JObject> ParseJsonObjects(string stdout)
+    {
+        var objs = new List<JObject>();
+        foreach (var line in stdout.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (!trimmed.StartsWith('{')) continue;
+            try { objs.Add(JObject.Parse(trimmed)); } catch { /* non-JSON chatter */ }
+        }
+        if (objs.Count == 0 && stdout.Contains('{'))
+        {
+            // Pretty-printed output — try the whole capture as one object.
+            try { objs.Add(JObject.Parse(stdout[stdout.IndexOf('{')..])); } catch { }
+        }
+        return objs;
+    }
+
+    /// <summary>
+    /// Enumerate every FMOD .bank (VFS + loose) and list its playable streams
+    /// with names from the FSB name table where present. .strings.bank holds
+    /// only the GUID→event-path table — no sample data — so it's skipped.
+    /// </summary>
+    private static void HandleScanFmodBanks(JObject cmd)
+    {
+        EnsureProvider();
+
+        var bankPaths = new List<string>();
+        foreach (var file in _provider!.Files)
+        {
+            var lower = file.Value.Path.ToLowerInvariant();
+            if (lower.EndsWith(".bank") && !lower.EndsWith(".strings.bank"))
+                bankPaths.Add(file.Value.Path);
+        }
+        foreach (var (loosePath, _) in _looseFiles)
+        {
+            var lower = loosePath.ToLowerInvariant();
+            if (lower.EndsWith(".bank") && !lower.EndsWith(".strings.bank"))
+                bankPaths.Add(loosePath);
+        }
+
+        if (bankPaths.Count == 0)
+        {
+            Respond(new { type = "fmod_scan_result", found = false, total_banks = 0, total_streams = 0, banks = Array.Empty<object>() });
+            return;
+        }
+
+        InitVgmstream();
+        if (_vgmstreamPath == null)
+        {
+            Respond(new { type = "warning", message = "FMOD scan: vgmstream unavailable — banks cannot be decoded" });
+            Respond(new { type = "fmod_scan_result", found = false, total_banks = bankPaths.Count, total_streams = 0, banks = Array.Empty<object>() });
+            return;
+        }
+
+        Respond(new { type = "progress", current = 0, total = bankPaths.Count, message = $"Scanning {bankPaths.Count} FMOD bank(s)..." });
+
+        var banks = new List<object>();
+        int totalStreams = 0, scanned = 0;
+
+        foreach (var bankPath in bankPaths)
+        {
+            if (_cts.Token.IsCancellationRequested) break;
+            scanned++;
+            Respond(new { type = "progress", current = scanned, total = bankPaths.Count, message = $"Scanning FMOD bank: {Path.GetFileName(bankPath)}" });
+
+            try
+            {
+                var local = GetFmodBankLocalPath(bankPath, out var err);
+                if (local == null)
+                {
+                    Respond(new { type = "warning", message = $"FMOD scan: {Path.GetFileName(bankPath)}: {err}" });
+                    continue;
+                }
+
+                var infos = ProbeFmodBank(local);
+                if (infos.Count == 0) continue; // metadata-only bank (no FSB payload)
+
+                var streams = new List<object>();
+                foreach (var info in infos)
+                {
+                    var index = info.SelectToken("streamInfo.index")?.Value<int>() ?? (streams.Count + 1);
+                    // Single-stream banks report index 0 (no subsong selection);
+                    // vgmstream's -s flag is 1-based, so normalize.
+                    if (index <= 0) index = streams.Count + 1;
+                    var name = info.SelectToken("streamInfo.name")?.Value<string>() ?? "";
+                    var sampleRate = info.Value<int?>("sampleRate") ?? 0;
+                    var samples = info.Value<long?>("numberOfSamples") ?? 0;
+                    var durationMs = sampleRate > 0 ? (long)(samples * 1000.0 / sampleRate) : 0;
+                    streams.Add(new { index, name, sample_rate = sampleRate, duration_ms = durationMs });
+                }
+
+                totalStreams += streams.Count;
+                banks.Add(new { bank_vfs_path = bankPath, bank_name = Path.GetFileName(bankPath), streams });
+            }
+            catch (Exception ex)
+            {
+                Respond(new { type = "warning", message = $"FMOD scan: skipped {Path.GetFileName(bankPath)}: {SanitizeMessage(ex.Message)}" });
+            }
+        }
+
+        Respond(new
+        {
+            type = "fmod_scan_result",
+            found = banks.Count > 0,
+            total_banks = banks.Count,
+            total_streams = totalStreams,
+            banks
+        });
+    }
+
+    /// <summary>
+    /// Export individual FMOD bank streams to WAV. Each entry is
+    /// { bank_vfs_path, stream_index, target_name, target_folder }; replies
+    /// with the standard export_done payload (succeeded carries disk paths).
+    /// </summary>
+    private static void HandleExportFmodAudio(JObject cmd)
+    {
+        EnsureProvider();
+        var outputDir = cmd.Value<string>("output_dir") ?? throw new ArgumentException("output_dir required");
+        var entries = cmd["entries"] as JArray ?? throw new ArgumentException("entries required");
+
+        Directory.CreateDirectory(outputDir);
+
+        int total = entries.Count, current = 0;
+        var succeeded = new List<string>();
+        var failed = new List<object>();
+
+        Respond(new { type = "progress", current = 0, total, message = $"Exporting {total} FMOD stream(s)..." });
+
+        foreach (var entry in entries)
+        {
+            if (_cts.Token.IsCancellationRequested) break;
+            current++;
+
+            var bankPath = entry.Value<string>("bank_vfs_path") ?? "";
+            var streamIndex = entry.Value<int?>("stream_index") ?? 0;
+            var targetName = entry.Value<string>("target_name") ?? "";
+            var targetFolder = entry.Value<string>("target_folder") ?? "";
+
+            var safeName = SanitizeName(targetName);
+            if (string.IsNullOrEmpty(safeName) || streamIndex <= 0)
+            {
+                failed.Add(new { path = bankPath, error = "Invalid target_name or stream_index" });
+                continue;
+            }
+
+            string safeSubDir;
+            try
+            {
+                safeSubDir = SafeJoinFolderSegments(outputDir, targetFolder);
+            }
+            catch (Exception ex)
+            {
+                failed.Add(new { path = bankPath, error = $"Invalid target_folder: {SanitizeMessage(ex.Message)}" });
+                continue;
+            }
+
+            if (current % 10 == 0 || current == total)
+                Respond(new { type = "progress", current, total, message = $"Exporting FMOD audio: {safeName}" });
+
+            try
+            {
+                var local = GetFmodBankLocalPath(bankPath, out var err);
+                if (local == null)
+                {
+                    failed.Add(new { path = bankPath, error = err ?? "bank unavailable" });
+                    continue;
+                }
+
+                Directory.CreateDirectory(safeSubDir);
+                var outPath = SafeJoin(safeSubDir, $"{safeName}.wav");
+                var run = RunVgmstreamCapture(new[] { "-s", streamIndex.ToString(), "-o", outPath, local }, 60_000);
+                if (run == null || run.Value.ExitCode != 0 || !File.Exists(outPath))
+                {
+                    failed.Add(new { path = $"{bankPath}#{streamIndex}", error = "vgmstream conversion failed" });
+                    continue;
+                }
+                succeeded.Add(outPath);
+            }
+            catch (Exception ex)
+            {
+                failed.Add(new { path = $"{bankPath}#{streamIndex}", error = SanitizeMessage(ex.Message) });
+            }
+        }
+
+        Respond(new { type = "export_done", succeeded, failed, total = entries.Count });
     }
 
     // ─── Export video (FileMediaSource + raw video files) ─────────────

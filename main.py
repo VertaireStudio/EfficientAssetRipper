@@ -4,10 +4,10 @@ import sys
 import logging
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QPointF, QRect, QRectF, QTimer
+from PySide6.QtCore import Qt, QPointF, QRectF
 from PySide6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QBrush, QPen,
-    QLinearGradient, QPolygonF,
+    QLinearGradient, QPainterPath, QPolygonF,
 )
 
 from gui.main_window import MainWindow
@@ -62,38 +62,40 @@ def _make_icon() -> QIcon:
         p.drawPolygon(gem)
 
         # --- inner facet lines (only worth drawing at >=32 px) ---
+        # Clipped to the gem silhouette so stroke width never pokes past
+        # the edges, and symmetric so the gem doesn't look lopsided.
         if size >= 32:
+            clip = QPainterPath()
+            clip.addPolygon(gem)
+            clip.closeSubpath()
+            p.save()
+            p.setClipPath(clip)
             lw = max(1.0, s * 0.025)
-            p.setPen(QPen(QColor(255, 255, 255, 190), lw))
-            p.drawLine(QPointF(cx, cy - dh), QPointF(cx + dw, cy))
-            p.drawLine(QPointF(cx, cy - dh), QPointF(cx - dw * 0.55, cy - dh * 0.25))
-            p.setPen(QPen(QColor(255, 255, 255, 80), lw * 0.7))
+            p.setPen(QPen(QColor(255, 255, 255, 170), lw))
+            p.drawLine(QPointF(cx, cy - dh), QPointF(cx - dw * 0.5, cy))
+            p.drawLine(QPointF(cx, cy - dh), QPointF(cx + dw * 0.5, cy))
+            p.setPen(QPen(QColor(255, 255, 255, 70), lw * 0.8))
             p.drawLine(QPointF(cx - dw, cy), QPointF(cx + dw, cy))
+            p.drawLine(QPointF(cx, cy + dh), QPointF(cx - dw * 0.5, cy))
+            p.drawLine(QPointF(cx, cy + dh), QPointF(cx + dw * 0.5, cy))
+            p.restore()
 
         # --- outer glow ring ---
+        # Kept small enough (scale * dh + pen/2 < tile half-extent) that it
+        # never crosses the rounded background's edge.
         if size >= 32:
-            gw = max(1.5, s * 0.055)
+            gw = max(1.5, s * 0.045)
             glow_pen = QPen(QColor(c["accent"]).lighter(120), gw)
             glow_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             p.setPen(glow_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            scale = 1.22
+            scale = 1.15
             p.drawPolygon(QPolygonF([
                 QPointF(cx,              cy - dh * scale),
                 QPointF(cx + dw * scale, cy),
                 QPointF(cx,              cy + dh * scale),
                 QPointF(cx - dw * scale, cy),
             ]))
-
-        # --- tiny accent dots at cardinal corners (>=48 px) ---
-        if size >= 48:
-            dot_r = s * 0.035
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(c["accent"]).lighter(140)))
-            for dx, dy in ((0, -dh * 1.32), (dw * 1.32, 0),
-                           (0, dh * 1.32), (-dw * 1.32, 0)):
-                p.drawEllipse(QRectF(cx + dx - dot_r, cy + dy - dot_r,
-                                     dot_r * 2, dot_r * 2))
 
         p.end()
         icon.addPixmap(px)
@@ -151,6 +153,10 @@ def main():
     # Apply centralised theme (palette + stylesheet)
     _load_saved_custom_schemes()
     saved_scheme = config.get("color_scheme") or None
+    try:
+        theme.set_ui_scale(config.get_int("ui_scale") / 100.0)
+    except (TypeError, ValueError):
+        pass  # corrupt registry value — stay at 100%
     theme.apply(app, saved_scheme)
 
     icon = _make_icon()
@@ -163,26 +169,12 @@ def main():
     window.setWindowIcon(icon)
 
     if SHOW_SPLASH:
-        # Show the main window first so Windows treats it as the active app
-        # window from frame 1 — the splash will cover it visually but won't
-        # steal focus (WA_ShowWithoutActivating). When the splash closes,
-        # focus naturally stays on the window instead of getting handed off
-        # to whatever app was previously active.
+        # The splash is a child overlay inside the main window, not a second
+        # OS window. Creating it before show() means the window's very first
+        # presented frame is already the splash cover — no flash of bare UI
+        # on launch, and nothing to close/hand off when the animation ends.
+        splash = SplashScreen(parent=window)
         window.show()
-
-        def _on_splash_done():
-            # Belt-and-braces: ensure the window is on top + has focus once
-            # the splash has finished animating away.
-            window.raise_()
-            window.activateWindow()
-
-        # MainWindow has already realised its geometry (saved layout or
-        # default centring) inside __init__, so read the live frame here.
-        _wg = window.frameGeometry()
-        splash = SplashScreen(
-            finish_callback=_on_splash_done,
-            target_rect=QRect(_wg.x(), _wg.y(), _wg.width(), _wg.height()),
-        )
         splash.start()
     else:
         window.show()
