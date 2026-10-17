@@ -8,6 +8,7 @@ covers global tooling paths shared across every profile.
 from __future__ import annotations
 
 import os
+import sys
 
 from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -84,7 +85,12 @@ class SettingsDialog(QDialog):
         )
 
         self.blender_exe = PathPicker(
-            mode="file", filter_str="Blender (blender.exe);;All Files (*)",
+            mode="file",
+            filter_str=(
+                "Blender (blender.exe)"
+                if sys.platform == "win32"
+                else "Blender (blender);;All Files (*)"
+            ),
             title="Select Blender Executable",
         )
         self.blender_exe.setText(
@@ -92,8 +98,12 @@ class SettingsDialog(QDialog):
         )
         paths_form.addRow("Blender Executable:", self.blender_exe)
 
+        everything_filter = (
+            "DLL Files (*.dll);;All Files (*)" if sys.platform == "win32"
+            else "All Files (*)"
+        )
         self.everything_dll = PathPicker(
-            mode="file", filter_str="DLL Files (*.dll);;All Files (*)",
+            mode="file", filter_str=everything_filter,
             title="Select Everything SDK DLL",
         )
         self.everything_dll.setText(
@@ -108,11 +118,15 @@ class SettingsDialog(QDialog):
         self.presets_path.setText(str(config.get_presets_path()))
         paths_form.addRow("Texture Presets JSON:", self.presets_path)
 
+        cli_filter = (
+            "Executable (CUE4ParseCLI.exe)" if sys.platform == "win32"
+            else "Executable (CUE4ParseCLI);;All Files (*)"
+        )
         self.cue4parse_cli = PathPicker(
-            mode="file", filter_str="Executable (CUE4ParseCLI.exe);;All Files (*)",
+            mode="file", filter_str=cli_filter,
             title="Select CUE4Parse CLI",
         )
-        self.cue4parse_cli.setText(config.get("cue4parse_cli"))
+        self.cue4parse_cli.setText(config.get_cue4parse_cli())
         paths_form.addRow("CUE4Parse CLI:", self.cue4parse_cli)
 
         # --- Processing group ---
@@ -550,25 +564,10 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _auto_detect_blender() -> str:
-        candidates = [
-            r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
-        return ""
+        from core import tools_detect
+        return tools_detect.detect_blender()
 
     @staticmethod
     def _auto_detect_everything() -> str:
-        candidates = [
-            r"C:\Program Files\Everything\Everything64.dll",
-            r"C:\Program Files (x86)\Everything\Everything64.dll",
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
-        return ""
+        from core import tools_detect
+        return tools_detect.detect_everything_dll()

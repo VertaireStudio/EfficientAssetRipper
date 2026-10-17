@@ -30,8 +30,8 @@ from PySide6.QtWidgets import (
 )
 
 import config
-from _base import base_dir
 from _version import __version__
+from core import tools_detect
 from gui.settings_panel import SettingsDialog
 
 log = logging.getLogger(__name__)
@@ -43,15 +43,23 @@ log = logging.getLogger(__name__)
 
 def detect_blender() -> tuple[bool, str]:
     """Return (found, detail). Detail is the resolved path or a hint."""
-    path = config.get("blender_exe") or SettingsDialog._auto_detect_blender()
+    path = config.get("blender_exe") or tools_detect.detect_blender()
     if path and Path(path).is_file():
         return True, path
-    return False, "Not found in default install locations"
+    location = "PATH" if not os.name == "nt" else "default install locations"
+    return False, f"Blender not found in {location} or common install dirs"
 
 
 def detect_everything() -> tuple[bool, str]:
-    """Return (found, detail). Detail is the DLL path or a hint."""
-    path = config.get("everything_dll") or SettingsDialog._auto_detect_everything()
+    """Return (found, detail). Detail is the DLL path or a hint.
+
+    Everything SDK is a Windows app; on other platforms the app scans via
+    the built-in WalkSearcher fallback, so this probe reports success there
+    with a note rather than a red ✗.
+    """
+    if os.name != "nt":
+        return True, "Windows app — built-in WalkSearcher used on this OS"
+    path = config.get("everything_dll") or tools_detect.detect_everything_dll()
     if path and Path(path).is_file():
         return True, path
     return False, "Everything64.dll not found — install Everything desktop"
@@ -61,12 +69,12 @@ def detect_dotnet() -> tuple[bool, str]:
     """Return (found, detail).
 
     The CUE4Parse CLI is shipped self-contained (the .NET runtime is baked
-    into ``CUE4ParseCLI.exe``), so we first check whether the bundled CLI
-    exists — if so, the user needs nothing else. Only fall back to probing
+    into the binary), so we first check whether the bundled CLI exists — if
+    so, the user needs nothing else. Only fall back to probing
     ``dotnet --version`` when the bundled CLI is missing (which means the
     user is running from source and needs .NET to build it).
     """
-    cli_path = base_dir() / "cue4parse_cli" / "bin" / "publish" / "CUE4ParseCLI.exe"
+    cli_path = tools_detect.bundled_cue4parse_cli()
     if cli_path.is_file():
         return True, "CUE4Parse CLI bundled (no .NET install needed)"
 
@@ -138,10 +146,15 @@ class _DependencyPage(QWizardPage):
         layout = QVBoxLayout(self)
 
         self._rows: dict[str, dict] = {}
+        everything_label = (
+            "Everything (must be running)"
+            if os.name == "nt"
+            else "Everything (Linux: built-in walker used)"
+        )
         for key, label, hint_url in (
             ("blender", "Blender 4.0+", "https://www.blender.org/download/"),
-            ("everything", "Everything (must be running)", "https://www.voidtools.com/"),
-            ("dotnet", "CUE4Parse CLI / .NET 8.0", "https://dotnet.microsoft.com/download/dotnet/8.0"),
+            ("everything", everything_label, "https://www.voidtools.com/"),
+            ("dotnet", "CUE4Parse CLI / .NET 10.0", "https://dotnet.microsoft.com/download/dotnet/10.0"),
         ):
             row = QHBoxLayout()
             status = QLabel("…")
@@ -174,12 +187,13 @@ class _DependencyPage(QWizardPage):
         self.recheck()
 
     def recheck(self):
+        probe_results: dict[str, tuple[bool, str]] = {}
         for key, probe in (
             ("blender", detect_blender),
             ("everything", detect_everything),
             ("dotnet", detect_dotnet),
         ):
-            ok, detail = probe()
+            ok, detail = probe_results[key] = probe()
             row = self._rows[key]
             row["status"].setText("✓" if ok else "✗")
             row["status"].setStyleSheet(
@@ -189,12 +203,12 @@ class _DependencyPage(QWizardPage):
 
         # If Blender was detected, persist it so the rest of the wizard
         # (and the main window) can use it without prompting again.
-        ok, path = detect_blender()
-        if ok and not config.get("blender_exe"):
-            config.set("blender_exe", path)
-        ok, path = detect_everything()
-        if ok and not config.get("everything_dll"):
-            config.set("everything_dll", path)
+        if probe_results["blender"][0] and not config.get("blender_exe"):
+            config.set("blender_exe", probe_results["blender"][1])
+        if os.name == "nt" and probe_results["everything"][0] and not config.get("everything_dll"):
+            config.set("everything_dll", probe_results["everything"][1])
+        if probe_results["dotnet"][0] and not config.get("cue4parse_cli"):
+            config.set("cue4parse_cli", probe_results["dotnet"][1])
 
 
 class _ProfilePage(QWizardPage):

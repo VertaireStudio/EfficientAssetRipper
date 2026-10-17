@@ -9,6 +9,18 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+
+
+def _split_any_path(candidate) -> tuple[str, ...]:
+    """Split a path string into parts despite platform separator differences.
+
+    PSK paths and game folders flow in from profiles, caches, and the CLI —
+    a cache written on Windows may still carry backslash separators when
+    consumed on Linux (and vice versa in the tests). Normalising to forward
+    slashes before splitting keeps classification platform-independent.
+    """
+    raw = str(candidate).replace("\\", "/")
+    return tuple(p for p in raw.split("/") if p)
 from pathlib import Path, PurePosixPath
 
 log = logging.getLogger(__name__)
@@ -86,16 +98,19 @@ def _relative_parts(psk_path: Path, game_folder: str) -> tuple[tuple[str, ...], 
        sibling directory but still share a recognisable UE root.
     """
     try:
-        return psk_path.relative_to(game_folder).parts, ""
+        relative = Path(str(psk_path).replace("\\", "/")).relative_to(
+            Path(str(game_folder).replace("\\", "/"))
+        )
+        return relative.parts, ""
     except ValueError:
         pass
 
-    psk_parts = psk_path.parts
+    psk_parts = _split_any_path(psk_path)
     if not psk_parts:
         return (), "empty_psk_path"
 
     psk_lower = tuple(p.lower() for p in psk_parts)
-    gf_parts = Path(game_folder).parts if game_folder else ()
+    gf_parts = _split_any_path(game_folder)
     gf_lower = tuple(p.lower() for p in gf_parts)
 
     if gf_lower and len(gf_lower) <= len(psk_lower):

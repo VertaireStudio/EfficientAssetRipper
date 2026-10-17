@@ -88,4 +88,46 @@ class TestExportFailurePopup:
             "unpack_output_dir": "",
             "aes_keys": [],
         })
+
+    def test_export_done_cancelled_summary_not_success(self, panel):
+        """A cancelled run must not be reported as "Export complete"."""
+        panel._on_export_done(["Game/A"], [], cancelled=True, remaining=9)
+        assert "cancelled" in panel._status_label.text()
+        assert "9" in panel._status_label.text()
+
+    def test_export_done_cancelled_with_failures_no_popup(self, panel, mocker):
+        spy = mocker.patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Ok)
+        panel._on_export_done(["Game/A"], [{"path": "x", "error": "boom"}],
+                              cancelled=True, remaining=5)
+        spy.assert_not_called()
+
+    def test_export_done_cancelled_drops_pending_chain(self, panel, mocker):
+        """Cancel must not kick off the queued FMOD/WWise export stage."""
+        fmod_spy = mocker.patch.object(panel._unpacker, "export_fmod_audio")
+        wwise_spy = mocker.patch.object(panel._unpacker, "export_wwise_audio")
+        panel._pending_fmod_export = ([{"bank": "x"}], "/tmp/out")
+        panel._pending_wwise_export = ([{"wem": "y"}], "/tmp/out")
+        panel._on_export_done([], [], cancelled=True, remaining=1)
+        assert panel._pending_fmod_export is None
+        assert panel._pending_wwise_export is None
+        fmod_spy.assert_not_called()
+        wwise_spy.assert_not_called()
+
+    def test_export_done_warning_count_shown_in_summary(self, panel):
+        panel._on_export_done(["Game/A"], [], warning_count=1167)
+        assert "1167 asset warnings" in panel._status_label.text()
+
+    def test_process_ended_during_export_logs_abort(self, panel, qtbot):
+        panel._exporting = True
+        with qtbot.waitSignal(panel.log_message, timeout=1000) as sig:
+            panel._on_process_ended()
+        assert "aborted" in sig.args[0].lower()
+        assert panel._exporting is False
+
+    def test_process_ended_idle_no_abort_warning(self, panel):
+        panel._exporting = False
+        sent = []
+        panel.log_message.connect(lambda m, l: sent.append((m, l)))
+        panel._on_process_ended()
+        assert not any("aborted" in m.lower() for m, _ in sent)
         assert panel._suppress_export_error_popup is False

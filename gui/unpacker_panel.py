@@ -2193,7 +2193,16 @@ class UnpackerPanel(QWidget):
         self._status_label.setText(message)
 
     @Slot(list, list)
-    def _on_export_done(self, succeeded: list, failed: list):
+    def _on_export_done(self, succeeded: list, failed: list, cancelled: bool = False,
+                        remaining: int = 0, warning_count: int = 0):
+        # A cancelled run must not kick off the next chained export stage —
+        # the user asked to stop, so stop. Drop the pending stages instead.
+        if cancelled and (self._pending_wwise_export or self._pending_fmod_export):
+            self._pending_wwise_export = None
+            self._pending_fmod_export = None
+            self.log_message.emit(
+                "Export cancelled — skipping the queued audio export stage", "warning")
+
         # If there's a pending wwise audio export, send it now (chained)
         if self._pending_wwise_export:
             entries, out_dir = self._pending_wwise_export
@@ -2284,13 +2293,23 @@ class UnpackerPanel(QWidget):
         self._progress.setValue(len(succeeded) + len(failed))
 
         msg = f"Export complete: {len(succeeded)} succeeded, {len(failed)} failed"
-        self._status_label.setText(msg)
-        self.log_message.emit(msg, "success" if not failed else "warning")
+        if cancelled:
+            msg = f"Export cancelled: {len(succeeded)} succeeded, {len(failed)} failed, {remaining} not attempted"
+            self._status_label.setText(msg)
+            self.log_message.emit(msg, "warning")
+        elif warning_count > 0:
+            msg += f" ({warning_count} asset warnings)"
+            self._status_label.setText(msg)
+            self.log_message.emit(msg, "warning")
+        else:
+            self._status_label.setText(msg)
+            self.log_message.emit(msg, "success" if not failed else "warning")
 
         if failed:
             details = "\n".join(f"  {f.get('path', '?')}: {f.get('error', '?')}" for f in failed[:20])
             self.log_message.emit(f"Failed exports:\n{details}", "error")
-            self._show_export_failure_popup(failed)
+            if not cancelled:
+                self._show_export_failure_popup(failed)
 
         # Enable hand-off only for PSKs THIS export actually wrote. A file
         # counts as "newly written" if its path is missing from the snapshot
@@ -2479,6 +2498,12 @@ class UnpackerPanel(QWidget):
 
     @Slot()
     def _on_process_ended(self):
+        if self._exporting:
+            # The CLI died (or was killed) mid-export without sending export_done.
+            # Without this note the summary numbers never arrive and the log just
+            # trails off with progress lines — looks like a hang, not an abort.
+            self.log_message.emit(
+                "Export aborted — CLI exited before its export finished", "warning")
         self._exporting = False
         self._mounted = False
         self._suppress_export_error_popup = False

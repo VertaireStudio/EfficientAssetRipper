@@ -99,6 +99,7 @@ The repo has at times lived on cloud-synced folders; .NET file locks broke
 ```powershell
 dotnet publish cue4parse_cli/CUE4ParseCLI.csproj -c Release -r win-x64 `
   --self-contained true -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
   -o "$env:TEMP\CUE4ParseCLI_build"
 # then copy $env:TEMP\CUE4ParseCLI_build\* → cue4parse_cli/bin/publish/
 ```

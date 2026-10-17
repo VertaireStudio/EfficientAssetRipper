@@ -51,7 +51,7 @@ internal static class Program
     private static string _audioFormat = "wav";   // wav or ogg
     private static string _gameDir = "";          // current game directory (for loose file reads)
     private static Dictionary<string, string> _looseFiles = new(StringComparer.OrdinalIgnoreCase); // VFS path → disk path for files CUE4Parse doesn't discover
-    private static string? _vgmstreamPath;         // cached path to vgmstream-cli.exe
+    private static string? _vgmstreamPath;         // cached path to vgmstream-cli
     private static Dictionary<string, string> _wemIdToName = new(StringComparer.OrdinalIgnoreCase); // WEM numeric ID → debug name
     private static Dictionary<string, string> _fmodBankCache = new(StringComparer.OrdinalIgnoreCase); // bank VFS path → materialized temp file
     private static string? _wemNameCachePath;       // per-game disk cache for WEM name map
@@ -61,6 +61,12 @@ internal static class Program
     private static readonly Queue<JObject> _pendingGetProps = new(); // get_props commands queued during export
     private static readonly Queue<JObject> _pendingCommands = new(); // whole-export commands queued during a concurrent export/scan
     private static readonly object _respondLock = new(); // guards stdout writes during concurrent export
+    // Per-export warning counter: object-level export failures (e.g. a Texture2D
+    // that can't decode) surface as warnings while the asset still exports its
+    // props file, so "export_done" would otherwise read a clean success. The
+    // count rides along on export_done so the parent can say "finished with N
+    // asset warnings" instead of unqualified success.
+    private static int _exportWarningCount;
 
     // Version-mismatch hint: when a stream of warnings/errors look like the UE
     // struct layout doesn't match the data on disk, surface a one-shot hint to
@@ -173,6 +179,24 @@ internal static class Program
     }
 
     /// <summary>
+    /// Human-readable, sanitized single-line description of an exception chain:
+    /// outer type name + message, then the inner exception type (which is where
+    /// native-load failures actually live — TypeInitializationException alone
+    /// tells the user nothing about WHY Skia/Oodle failed to load).
+    /// </summary>
+    private static string DescribeException(Exception ex)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append(ex.GetType().Name).Append(": ").Append(SanitizeMessage(ex.Message));
+        if (ex.InnerException != null)
+        {
+            sb.Append(" (inner: ").Append(ex.InnerException.GetType().Name).Append(": ")
+               .Append(SanitizeMessage(ex.InnerException.Message)).Append(')');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
     /// Run <paramref name="action"/> on a 4 MB-stack background thread to avoid
     /// StackOverflow on deeply-nested CUE4Parse object graphs. Caps active
     /// threads at <see cref="MaxConcurrentSerializeThreads"/>; on overflow
@@ -225,15 +249,40 @@ internal static class Program
     // Pin downloaded toolchain artifacts by SHA-256. If GitHub serves a different
     // payload (compromise or version drift), download is rejected. Update these
     // when bumping the URL/tag.
-    private const string OodleZipSha256 =
+    private const string OodleZipSha256Win =
         "2c7b9350b1a396690ef233fc79f945b62453e7f9b026645e00b75a2d8569f283";
-    private const string OodleZipUrl =
+    private const string OodleZipUrlWin =
         "https://github.com/WorkingRobot/OodleUE/releases/download/2026-01-25-1223/clang-cl-x64-release.zip";
 
-    private const string VgmstreamZipSha256 =
+    // Linux artifact from the same OodleUE release (gcc build). Contains
+    // lib/liboodle-data-shared.so — the .so form CUE4Parse's OodleHelper
+    // expects on Linux. Pin verified against the immutable release tag.
+    private const string OodleZipSha256Linux =
+        "c2a92f52e1d41119c0248857fb3790757159a42009d6d419a5dafd65ec159661";
+    private const string OodleZipUrlLinux =
+        "https://github.com/WorkingRobot/OodleUE/releases/download/2026-01-25-1223/gcc-x64-release.zip";
+
+    public static string OodleZipUrlActive =>
+        OperatingSystem.IsWindows() ? OodleZipUrlWin : OodleZipUrlLinux;
+    public static string OodleZipSha256Active =>
+        OperatingSystem.IsWindows() ? OodleZipSha256Win : OodleZipSha256Linux;
+
+    private const string VgmstreamZipSha256Win =
         "7a8f9556df7706e5dca74169ace817c1eda6bb8d8f0ab68810e6ec4c0d300573";
-    private const string VgmstreamZipUrl =
+    private const string VgmstreamZipUrlWin =
         "https://github.com/vgmstream/vgmstream/releases/download/r1980/vgmstream-win64.zip";
+
+    // Same tagged r1980 release ships a statically linked Linux CLI.
+    // Contains vgmstream-cli at the zip root (no trailing libs needed).
+    private const string VgmstreamZipSha256Linux =
+        "e5fadc668c68184eec1b3593de9e3ba9b7a61c396aaf90aa8680a5f7c2caf2dd";
+    private const string VgmstreamZipUrlLinux =
+        "https://github.com/vgmstream/vgmstream/releases/download/r1980/vgmstream-linux-cli.zip";
+
+    public static string VgmstreamZipUrlActive =>
+        OperatingSystem.IsWindows() ? VgmstreamZipUrlWin : VgmstreamZipUrlLinux;
+    public static string VgmstreamZipSha256Active =>
+        OperatingSystem.IsWindows() ? VgmstreamZipSha256Win : VgmstreamZipSha256Linux;
 
     // Hard cap on a single NDJSON command line. Anything bigger is treated as
     // adversarial input (stuck/runaway parent) — drop the line and respond with
@@ -709,8 +758,26 @@ internal static class Program
         }
         foreach (var k in keys)
         {
-            var guid = k.Value<string>("guid") ?? "00000000000000000000000000000000";
-            var hex = k.Value<string>("key") ?? "";
+            // Accept both shapes: {"guid": "...", "key": "0x..."} objects and
+            // bare "0x..." strings (common when a parent hands through a value
+            // scraped from Google/a key list without building the wrapper).
+            // Indexing a JValue used to throw mid-foreach and abort the whole
+            // init AFTER Oodle/zero-key setup — treat bad shapes as warnings.
+            string guid, hex;
+            switch (k)
+            {
+                case JValue v: // bare hex string
+                    guid = "00000000000000000000000000000000";
+                    hex = v.Value<string>() ?? "";
+                    break;
+                case JObject o:
+                    guid = o.Value<string>("guid") ?? "00000000000000000000000000000000";
+                    hex = o.Value<string>("key") ?? "";
+                    break;
+                default:
+                    Respond(new { type = "warning", message = $"aes_keys entry #{keysSubmitted}: unrecognized shape, skipping" });
+                    continue;
+            }
             if (string.IsNullOrEmpty(hex)) continue;
             try
             {
@@ -800,6 +867,22 @@ internal static class Program
             }
         }
 
+        // BC7/BC6H/ETC decode: CUE4Parse-Conversion's default path routes these
+        // through the native Detex.dll it embeds, which is Windows-only and is
+        // never initialized by this CLI — on Linux every TC_BC7 texture used
+        // to die with "Detex decompression failed: not initialized" (Islands
+        // of Insight: dozens of textures per export batch). Enable the pure-C#
+        // AssetRipper.TextureDecoder path instead: same output, no native lib
+        // needed, identical behavior to what CUE4Parse master uses on
+        // non-Windows hosts (it does Bc7/Bc6h/Bc1..Bc5/ASTC/ETC in managed
+        // code).
+        TextureDecoder.UseAssetRipperTextureDecoder = true;
+
+        // One-time texture-sdk probe: if Skia's native lib can't load, every
+        // texture export degenerates into hundreds of type-initializer errors
+        // mid-export. Warn once at mount time so it's diagnosable up front.
+        ProbeSkia();
+
         Respond(new
         {
             type = "init_done",
@@ -810,6 +893,36 @@ internal static class Program
             keys_submitted = keysSubmitted,
             unmounted_archives = unmountedArchives
         });
+    }
+
+    private static bool _skiaProbed;
+
+    /// <summary>
+    /// Cheap warm-up: touches SkiaSharp's static state so the DllImport /
+    /// extraction failure (if any) surfaces here, at init, with a full inner-exception
+    /// description instead of being repeated after every Texture2D in an export.
+    /// </summary>
+    private static void ProbeSkia()
+    {
+        if (_skiaProbed) return;
+        _skiaProbed = true;
+        try
+        {
+            // A real P/Invoke path (native surface allocation), not just a
+            // managed struct field — struct cctors only run at their first
+            // actual call sites, so a field read may dodge the failure.
+            using var bmp = new SkiaSharp.SKBitmap(4, 4);
+            bmp.Erase(SkiaSharp.SKColors.Transparent);
+        }
+        catch (Exception ex)
+        {
+            Respond(new
+            {
+                type = "warning",
+                message = "Skia native library could not be initialized — texture decoding is unavailable " +
+                          $"in this build: {DescribeException(ex)}"
+            });
+        }
     }
 
     // ─── Detect UE Version ───────────────────────────────────────────
@@ -1111,6 +1224,7 @@ internal static class Program
         var succeeded = new List<string>();
         var failed = new List<object>();
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _exportWarningCount = 0;
 
         foreach (var assetPath in paths)
         {
@@ -1132,7 +1246,17 @@ internal static class Program
             }
         }
 
-        Respond(new { type = "export_done", succeeded, failed, total = paths.Count });
+        var cancelled = _cts.Token.IsCancellationRequested;
+        Respond(new
+        {
+            type = "export_done",
+            succeeded,
+            failed,
+            total = paths.Count,
+            cancelled,
+            remaining = cancelled ? total - current : 0,
+            warning_count = _exportWarningCount,
+        });
         return Task.CompletedTask;
     }
 
@@ -1177,6 +1301,7 @@ internal static class Program
         var succeeded = new List<string>();
         var failed = new List<object>();
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _exportWarningCount = 0;
 
         Respond(new { type = "progress", current = 0, total, message = $"Found {total} assets to export" });
 
@@ -1200,7 +1325,17 @@ internal static class Program
             }
         }
 
-        Respond(new { type = "export_done", succeeded, failed, total = assetPaths.Count });
+        var cancelled = _cts.Token.IsCancellationRequested;
+        Respond(new
+        {
+            type = "export_done",
+            succeeded,
+            failed,
+            total = assetPaths.Count,
+            cancelled,
+            remaining = cancelled ? total - current : 0,
+            warning_count = _exportWarningCount,
+        });
         return Task.CompletedTask;
     }
 
@@ -1323,7 +1458,8 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                Respond(new { type = "warning", message = $"{obj.Name} ({obj.ExportType}): {SanitizeMessage(ex.Message)}" });
+                _exportWarningCount++;
+                Respond(new { type = "warning", message = $"{obj.Name} ({obj.ExportType}): {DescribeException(ex)}" });
             }
 
             // Serialize once — the JSON feeds both the props file and the
@@ -1722,7 +1858,13 @@ internal static class Program
     }
 
     // ─── Oodle Initialization ─────────────────────────────────────────
-    private static readonly string[] _oodleNames = { "oo2core_9_win64.dll", "oodle-data-shared.dll" };
+    // Shared-library names per OS (game ships, app cache). Windows games
+    // carry the DLL next to the shipping binary; Linux native builds ship
+    // the Oodle .so under Binaries/Linux.
+    private static readonly string[] _oodleNames =
+        OperatingSystem.IsWindows()
+            ? new[] { "oo2core_9_win64.dll", "oodle-data-shared.dll" }
+            : new[] { "liboodle-data-shared.so", "liboo2corelinux64.so", "liboo2corelinux64.so.9" };
 
     private static void InitOodle(string gameDir)
     {
@@ -1734,7 +1876,8 @@ internal static class Program
             Path.Combine(Path.GetTempPath(), "CUE4ParseCLI_oodle")
         };
 
-        // Walk up from game paks dir to find the game's Binaries (e.g., …/Binaries/Win64/)
+        // Walk up from game paks dir to find the game's Binaries
+        // (e.g., …/Binaries/Win64/ or …/Binaries/Linux/ for native builds)
         try
         {
             var dir = new DirectoryInfo(gameDir);
@@ -1744,6 +1887,8 @@ internal static class Program
                 searchDirs.Add(dir.FullName);
                 var bin64 = Path.Combine(dir.FullName, "Binaries", "Win64");
                 if (Directory.Exists(bin64)) searchDirs.Add(bin64);
+                var binLinux = Path.Combine(dir.FullName, "Binaries", "Linux");
+                if (Directory.Exists(binLinux)) searchDirs.Add(binLinux);
             }
         }
         catch { }
@@ -1780,8 +1925,12 @@ internal static class Program
         }
         catch { }
 
-        // 3. Manual download from OodleUE GitHub releases (hash-pinned)
-        var targetPath = Path.Combine(cacheDir, "oodle-data-shared.dll");
+        // 3. Manual download from OodleUE GitHub releases (hash-pinned per OS)
+        var zipEntryName = OperatingSystem.IsWindows()
+            ? "bin/oodle-data-shared.dll"
+            : "lib/liboodle-data-shared.so";
+        var fileName = Path.GetFileName(zipEntryName);
+        var targetPath = Path.Combine(cacheDir, fileName);
 
         Respond(new { type = "info", message = "Downloading Oodle decompression library..." });
         try
@@ -1792,24 +1941,25 @@ internal static class Program
             using (var http = new HttpClient())
             {
                 http.Timeout = TimeSpan.FromSeconds(30);
-                using var response = http.GetAsync(OodleZipUrl, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+                using var response = http.GetAsync(OodleZipUrlActive, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
                 response.EnsureSuccessStatusCode();
                 zipBytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
             }
 
+            var expectedHash = OodleZipSha256Active;
             var actualHash = ComputeSha256Hex(zipBytes);
-            if (!string.Equals(actualHash, OodleZipSha256, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
             {
-                Respond(new { type = "warning", message = $"Oodle download hash mismatch (expected {OodleZipSha256}, got {actualHash}). Refusing to extract." });
+                Respond(new { type = "warning", message = $"Oodle download hash mismatch (expected {expectedHash}, got {actualHash}). Refusing to extract." });
                 return;
             }
 
             using var zipStream = new MemoryStream(zipBytes, writable: false);
             using var zip = new ZipArchive(zipStream, ZipArchiveMode.Read);
-            var entry = zip.GetEntry("bin/oodle-data-shared.dll")
-                       ?? throw new FileNotFoundException("oodle-data-shared.dll not found in zip");
+            var entry = zip.GetEntry(zipEntryName)
+                       ?? throw new FileNotFoundException($"{zipEntryName} not found in zip");
             // SafeJoin guards against malicious entry names ("../foo")
-            var safePath = SafeJoin(cacheDir, "oodle-data-shared.dll");
+            var safePath = SafeJoin(cacheDir, fileName);
             using (var entryStream = entry.Open())
             using (var fs = File.Create(safePath))
             {
@@ -1864,7 +2014,8 @@ internal static class Program
         if (_vgmstreamPath != null) return;
 
         var cacheDir = Path.Combine(Path.GetTempPath(), "CUE4ParseCLI_vgmstream");
-        var exePath = Path.Combine(cacheDir, "vgmstream-cli.exe");
+        var exeName = OperatingSystem.IsWindows() ? "vgmstream-cli.exe" : "vgmstream-cli";
+        var exePath = Path.Combine(cacheDir, exeName);
 
         if (File.Exists(exePath))
         {
@@ -1883,15 +2034,16 @@ internal static class Program
             {
                 http.Timeout = TimeSpan.FromSeconds(60);
                 http.DefaultRequestHeaders.UserAgent.ParseAdd("CUE4ParseCLI/1.0");
-                using var resp = http.GetAsync(VgmstreamZipUrl, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+                using var resp = http.GetAsync(VgmstreamZipUrlActive, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
                 resp.EnsureSuccessStatusCode();
                 zipBytes = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
             }
 
+            var expectedVgmHash = VgmstreamZipSha256Active;
             var actualHash = ComputeSha256Hex(zipBytes);
-            if (!string.Equals(actualHash, VgmstreamZipSha256, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(actualHash, expectedVgmHash, StringComparison.OrdinalIgnoreCase))
             {
-                Respond(new { type = "warning", message = $"vgmstream download hash mismatch (expected {VgmstreamZipSha256}, got {actualHash}). Refusing to extract." });
+                Respond(new { type = "warning", message = $"vgmstream download hash mismatch (expected {expectedVgmHash}, got {actualHash}). Refusing to extract." });
                 return;
             }
 
@@ -1923,6 +2075,23 @@ internal static class Program
                 entryStream.CopyTo(fs);
             }
 
+            // Zip extraction does not restore POSIX exec bits; the static
+            // Linux binary must be marked executable or Process.Start fails.
+            if (!OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    File.SetUnixFileMode(exePath,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                        UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                        UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+                }
+                catch (Exception ex)
+                {
+                    Respond(new { type = "warning", message = $"Could not make vgmstream-cli executable: {SanitizeMessage(ex.Message)}" });
+                }
+            }
+
             if (File.Exists(exePath))
             {
                 _vgmstreamPath = exePath;
@@ -1930,7 +2099,7 @@ internal static class Program
             }
             else
             {
-                Respond(new { type = "warning", message = "vgmstream zip extracted but vgmstream-cli.exe not found" });
+                Respond(new { type = "warning", message = $"vgmstream zip extracted but {exeName} not found" });
             }
         }
         catch (Exception ex)
@@ -2410,6 +2579,7 @@ internal static class Program
             }
         }
 
+        var cancelled = _cts.Token.IsCancellationRequested;
         Respond(new
         {
             type = "wwise_scan_result",
@@ -2418,6 +2588,8 @@ internal static class Program
             events_prefix = eventsPrefix,
             total_events = eventAssets.Count,
             total_audio = audioEntries.Count,
+            remaining = cancelled ? eventAssets.Count - scanned : 0,
+            cancelled,
             audio = audioEntries
         });
     }
@@ -2504,7 +2676,17 @@ internal static class Program
             }
         }
 
-        Respond(new { type = "export_done", succeeded, failed, total = entries.Count });
+        var cancelled = _cts.Token.IsCancellationRequested;
+        Respond(new
+        {
+            type = "export_done",
+            succeeded,
+            failed,
+            total = entries.Count,
+            cancelled,
+            remaining = cancelled ? entries.Count - current : 0,
+            warning_count = 0,
+        });
         return Task.CompletedTask;
     }
 
@@ -2706,12 +2888,15 @@ internal static class Program
             }
         }
 
+        var cancelled = _cts.Token.IsCancellationRequested;
         Respond(new
         {
             type = "fmod_scan_result",
             found = banks.Count > 0,
             total_banks = banks.Count,
             total_streams = totalStreams,
+            remaining = cancelled ? bankPaths.Count - scanned : 0,
+            cancelled,
             banks
         });
     }
@@ -2791,7 +2976,17 @@ internal static class Program
             }
         }
 
-        Respond(new { type = "export_done", succeeded, failed, total = entries.Count });
+        var cancelled = _cts.Token.IsCancellationRequested;
+        Respond(new
+        {
+            type = "export_done",
+            succeeded,
+            failed,
+            total = entries.Count,
+            cancelled,
+            remaining = cancelled ? entries.Count - current : 0,
+            warning_count = 0,
+        });
     }
 
     // ─── Export video (FileMediaSource + raw video files) ─────────────
@@ -2888,7 +3083,17 @@ internal static class Program
             }
         }
 
-        Respond(new { type = "export_done", succeeded, failed, total = entries.Count });
+        var cancelledVideo = _cts.Token.IsCancellationRequested;
+        Respond(new
+        {
+            type = "export_done",
+            succeeded,
+            failed,
+            total = entries.Count,
+            cancelled = cancelledVideo,
+            remaining = cancelledVideo ? entries.Count - current : 0,
+            warning_count = 0,
+        });
         return Task.CompletedTask;
     }
 

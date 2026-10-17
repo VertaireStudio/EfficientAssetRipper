@@ -176,7 +176,7 @@ if exist "%CLI_BIN%" rmdir /s /q "%CLI_BIN%"
 :: Double trailing backslashes so MSBuild's command-line parser doesn't
 :: treat the closing \" as an escaped quote (which would swallow the next
 :: -p: arg). The doubled \\ collapses to a single \ inside the property.
-dotnet publish "%PROJECT_DIR%cue4parse_cli\CUE4ParseCLI.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:GenerateAssemblyInfo=false -p:GenerateTargetFrameworkAttribute=false -o "%CLI_PUB%" -p:BaseIntermediateOutputPath="%CLI_OBJ%\\" -p:BaseOutputPath="%CLI_BIN%\\"
+dotnet publish "%PROJECT_DIR%cue4parse_cli\CUE4ParseCLI.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:GenerateAssemblyInfo=false -p:GenerateTargetFrameworkAttribute=false -o "%CLI_PUB%" -p:BaseIntermediateOutputPath="%CLI_OBJ%\\" -p:BaseOutputPath="%CLI_BIN%\\"
 if %ERRORLEVEL% neq 0 (
     echo WARNING: CUE4ParseCLI rebuild failed.
     if exist "%PROJECT_DIR%cue4parse_cli\bin\publish\CUE4ParseCLI.exe" (

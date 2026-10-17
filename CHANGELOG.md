@@ -8,10 +8,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- FMOD audio support — `.bank` files (packed or loose on disk) are
-  scanned after mount; every stream appears as a named child row under
-  its bank for double-click preview and WAV export via vgmstream.
-  Selecting a bank or a folder above it exports all of its streams.
+- Linux platform support. The app, its Qt UI, and the full
+  Unpack → Scan → Resolve → Process pipeline now run on Linux x64:
+  - Blender detection covers PATH, `/usr/bin`, `/opt`, Flatpak, Snap,
+    and every Steam library (`steamapps/common/Blender/blender`), with
+    the classic Windows install paths still honoured.
+  - `build.sh` mirrors `build.bat`: pre-build test gate, PyInstaller
+    onedir bundle, runtime-dir preservation, self-contained
+    single-file CUE4ParseCLI publish, and zip/tar.gz packaging.
+  - FMOD audio support — `.bank` files (packed or loose on disk) are
+    scanned after mount; every stream appears as a named child row under
+    its bank for double-click preview and WAV export via vgmstream.
+    Selecting a bank or a folder above it exports all of its streams.
+
+### Changed
+- Everything SDK dependency is Windows-only: Linux scans use the
+  built-in file walker (the setup wizard now reports this as expected,
+  not as a dependency failure).
+- CUE4ParseCLI ships/tech-updates a platform-correct toolchain: Oodle
+  downloads `liboodle-data-shared.so` via the hash-pinned Linux zip and
+  searches `Binaries/Linux` for game-shipped Oodle; vgmstream downloads
+  the statically linked `vgmstream-linux-cli.zip` r1980 and marks the
+  extracted binary executable. Windows artifacts unchanged.
+- `docs/troubleshooting.md` and README document the Linux layout
+  (QSettings INI, walker fallback, Steam Blender detection).
+
+### Fixed
+- Classifier and texture-resolver path prefixing now treat backslash
+  and forward-slash separators equivalently on all platforms, so cached
+  Windows-style scan data classifies correctly after a platform switch.
+- Texture decoding crashed on Linux with hundreds of
+  `SkiaSharp.SKImageInfo` type-initializer failures during bulk exports:
+  the published single-file CLI now bundles its native libraries with
+  `IncludeNativeLibrariesForSelfExtract=true` (all three build scripts),
+  and pack init probes Skia once at mount so a broken native surfaces
+  immediately with its inner-exception detail instead of mid-export.
+- BC7/BC6H/ETC textures every-decoded as
+  `Detex decompression failed: not initialized` on Linux: the installed
+  CUE4Parse-Conversion routes those formats through a Windows-only
+  native Detex library that no host ever initializes. The CLI now
+  enables `TextureDecoder.UseAssetRipperTextureDecoder`, matching what
+  CUE4Parse itself uses on non-Windows hosts (verified: Islands of
+  Insight TC_BC7 textures export as valid PNGs; 133/141 sampled
+  textures decode). The remaining failure class — 8 leftover
+  `ASophia/Characters/.../old/` virtual textures — ships zlib-corrupt
+  tile payloads (verified against two CUE4Parse builds; dead content
+  the game no longer reads).
+- Cancellation is no longer reported as success. `export_done` (and the
+  WWise/FMOD scan results) carry `cancelled` and `remaining`, the GUI
+  logs "Export cancelled: N succeeded, M failed, K not attempted" rather
+  than "Export complete", skips queued audio-export chaining when you
+  stop a run, and notes "Export aborted — CLI exited before its export
+  finished" if the CLI dies mid-export.
+- Per-object export failures (e.g. a Texture2D that cannot decode) are
+  counted: export summaries now read "N successes, M failures (K asset
+  warnings)" instead of burying warning-level failures under
+  "0 failed".
+- `init` accepts AES keys both as `{"guid", "key"}` objects and as bare
+  hex strings; an unrecognized shape is skipped with a warning instead
+  of crashing the whole init.
 
 ## [0.9.0] - 2026-08-02
 

@@ -87,17 +87,20 @@ def get_presets_path() -> Path:
 
 
 def get_cue4parse_cli() -> str:
-    """Return a usable CUE4ParseCLI path, falling back to the bundled exe.
+    """Return a usable CUE4ParseCLI path, falling back to the bundled binary.
 
     Resolution order:
       1. The user-configured ``cue4parse_cli`` path, if it exists.
-      2. The bundled exe at ``<app>/cue4parse_cli/bin/publish/CUE4ParseCLI.exe``.
+      2. The bundled binary at ``<app>/cue4parse_cli/bin/publish/``, whose
+         name is platform-dependent (``CUE4ParseCLI.exe`` on Windows,
+         ``CUE4ParseCLI`` elsewhere).
       3. The configured value as-is, so the caller can produce its own
          "not found" error pointing at what the user actually set.
 
     This shields users whose stored path went stale (e.g. moved repos out
     of a Drive folder) from having to re-pick the CLI in Settings.
     """
+    from core.tools_detect import bundled_cue4parse_cli
     configured = get("cue4parse_cli")
     if configured:
         try:
@@ -105,7 +108,7 @@ def get_cue4parse_cli() -> str:
                 return configured
         except OSError:
             pass
-    bundled = base_dir() / "cue4parse_cli" / "bin" / "publish" / "CUE4ParseCLI.exe"
+    bundled = bundled_cue4parse_cli()
     if bundled.is_file():
         return str(bundled)
     return configured

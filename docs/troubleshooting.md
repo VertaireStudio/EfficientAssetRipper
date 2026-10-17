@@ -9,10 +9,15 @@ with the affected log file from `logs/` (with AES keys redacted).
 ## "Everything is not running" / scan returns nothing
 
 EfficientAssetRipper relies on the [Everything](https://www.voidtools.com/)
-desktop app for instant file search. There is **no fallback** — if
-Everything isn't running, asset discovery silently returns zero results.
+desktop app for instant file search on **Windows**. If it isn't running,
+asset discovery falls back to the built-in file walker, which is slow on
+large folders but finds the same files.
 
-Fixes:
+**Linux/macOS:** Everything is Windows-only software. Scans always use the
+built-in walker there (the Everything row in the setup wizard reports this),
+so a missing or disabled Everything is not a fault on those platforms.
+
+Fixes (Windows):
 
 1. Confirm Everything is installed and running (look for the magnifying-glass
    icon in the system tray).
@@ -89,6 +94,19 @@ shows the exact paths the resolver looked for.
 
 ---
 
+## Texture export warnings (per-asset decode failures)
+
+| Warning | Meaning | Fix |
+|---------|---------|-----|
+| `Detex decompression failed: not initialized` | Was a CLI bug: BC7/BC6H textures routed to a Windows-only native library on Linux. **Fixed** — the CLI now uses the pure-C# decoder. Update to the current build and re-export; if it still appears, report it. |
+| `Failed to decompress Zlib data (Expected: N, Result: 0)` (texture) | This specific asset's virtual-texture tile payload is unreadable even upstream of the tool — verified against two different CUE4Parse builds. Known in Islands of Insight: the 8 leftover `ASophia/Characters/.../old/...` character-skin textures that shipped in broken/partial form. The game itself doesn't read them (dead content from earlier builds); there is nothing to fix. |
+| `There is no game file with the path "Paper2D/PlaceholderTextures/..."` | The asset references an engine placeholder texture not cooked into the game. Harmless for meshes etc.; the referenced file simply doesn't exist in the archives. |
+
+Texture exports are per-asset: a decode failure on one file does not
+affect any other asset in the batch, and the summary counts it.
+
+---
+
 ## Crash dialog appeared — what now?
 
 The dialog has three buttons:
@@ -155,7 +173,9 @@ delete manually if you want a clean slate.
 - **Profiles** can be deleted via Manage Profiles → **Delete**. There
   must be at least one profile, so delete-all isn't possible.
 - **QSettings** lives in the Windows registry at
-  `HKCU\Software\EfficientAssetRipper`. Nuking that key resets
+  `HKCU\Software\EfficientAssetRipper` — or an INI file at
+  `~/.config/EfficientAssetRipper/EfficientAssetRipper.ini` on Linux.
+  Deleting that key (registry key on Windows, INI file on Linux) resets
   everything to first-launch state.
 
 ---

@@ -88,10 +88,10 @@ def test_optional_pyinstaller_available_for_build():
 
 
 def test_optional_platform_is_windows():
-    if sys.platform != "win32":
+    if sys.platform not in ("win32", "linux", "darwin"):
         warnings.warn(
-            f"Running on {sys.platform!r}; the app itself is Windows-only "
-            "(Everything SDK + PSK addon assumptions). Tests still run.",
+            f"Running on an unexpected platform {sys.platform!r}; the app is "
+            "tested on Windows and Linux. Tests still run.",
             UserWarning,
             stacklevel=2,
         )
@@ -150,12 +150,13 @@ def test_optional_cue4parse_cli_built():
     candidate = os.environ.get("CUE4PARSE_CLI")
     if candidate and Path(candidate).is_file():
         return
-    default = REPO_ROOT / "cue4parse_cli" / "bin" / "publish" / "CUE4ParseCLI.exe"
+    name = "CUE4ParseCLI.exe" if sys.platform == "win32" else "CUE4ParseCLI"
+    default = REPO_ROOT / "cue4parse_cli" / "bin" / "publish" / name
     if default.is_file():
         return
     warnings.warn(
-        f"CUE4ParseCLI.exe not built ({default} missing). Run build_cli.bat or "
-        "the build pipeline to produce it. Unpacker functionality will be unavailable.",
+        f"CUE4ParseCLI not built ({default} missing). Run build_cli.bat or "
+        "build_cli.sh to produce it. Unpacker functionality will be unavailable.",
         UserWarning,
         stacklevel=2,
     )

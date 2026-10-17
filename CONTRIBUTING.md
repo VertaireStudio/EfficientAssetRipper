@@ -8,8 +8,13 @@ Thanks for your interest! Bug reports, feature ideas, and PRs are all welcome.
 git clone https://github.com/exterminathan/EfficientAssetRipper.git
 cd EfficientAssetRipper
 
+# Windows
 py -m venv venv
 .\venv\Scripts\Activate.ps1
+
+# Linux/macOS
+python3 -m venv venv
+source venv/bin/activate
 
 pip install -r requirements.txt -r requirements-dev.txt
 ```
@@ -18,6 +23,12 @@ Then run the app:
 
 ```bash
 python main.py
+```
+
+Headless test runs (CI-ish environments without a display):
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m pytest
 ```
 
 ## Code map
@@ -39,10 +50,10 @@ For cooking your own UE5 fixtures (loose / pak / IoStore / AES-encrypted), see
 Run the fast tiers before opening a PR:
 
 ```bash
-py -m pytest
+python -m pytest          # Windows: py -m pytest
 ```
 
-Expect ~232 passing tests in ~10 seconds. The suite is structured as:
+Expect ~230 passing tests in ~10 seconds. The suite is structured as:
 
 - `tests/unit` — pure logic, no I/O
 - `tests/integration` — disk + fixtures
@@ -50,7 +61,8 @@ Expect ~232 passing tests in ~10 seconds. The suite is structured as:
 - `tests/e2e` — opt-in, gated by `BLENDER_EXE`, `EVERYTHING_DLL`, and
   `CUE4PARSE_CLI` env vars
 
-`build.bat` runs the fast tiers as step `[0b/5]` and aborts on any failure.
+`build.bat` / `build.sh` run the fast tiers as step `[0b/5]` and abort on
+any failure.
 
 ## Rebuilding the CUE4Parse CLI
 
@@ -64,13 +76,29 @@ dotnet publish "cue4parse_cli\CUE4ParseCLI.csproj" `
     --runtime win-x64 `
     --self-contained true `
     -p:PublishSingleFile=true `
+    -p:IncludeNativeLibrariesForSelfExtract=true `
     --output "$env:TEMP\CUE4ParseCLI_build"
 
 Copy-Item "$env:TEMP\CUE4ParseCLI_build\*" `
     "cue4parse_cli\bin\publish" -Recurse -Force
 ```
 
-`build.bat` does the same thing as part of step `[4/5]`.
+Linux (or just run `./build_cli.sh`, which does all of this):
+
+```bash
+dotnet publish "cue4parse_cli/CUE4ParseCLI.csproj" \
+    --configuration Release \
+    --runtime linux-x64 \
+    --self-contained true \
+    -p:PublishSingleFile=true \
+    -p:IncludeNativeLibrariesForSelfExtract=true \
+    --output "/tmp/CUE4ParseCLI_build"
+
+cp /tmp/CUE4ParseCLI_build/CUE4ParseCLI cue4parse_cli/bin/publish/
+chmod +x cue4parse_cli/bin/publish/CUE4ParseCLI
+```
+
+`build.bat` / `build.sh` do the same thing as part of step `[4/5]`.
 
 ## Branch & PR conventions
 

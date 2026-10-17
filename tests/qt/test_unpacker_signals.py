@@ -345,6 +345,43 @@ def test_path_traversal_in_export_done_failed_list(unpacker_with_stub, qtbot):
     assert "escapes" in sig.args[1][0]["error"].lower()
 
 
+def test_export_done_cancellation_fields_flow_through(unpacker_with_stub, qtbot):
+    """cancel/remaining/warning_count ride export_done so the panel can say
+    "Export cancelled: N succeeded, M failed, K not attempted"."""
+    up, proc = unpacker_with_stub
+    payload = {
+        "type": "export_done",
+        "succeeded": ["/Game/A.uasset"],
+        "failed": [],
+        "total": 10,
+        "cancelled": True,
+        "remaining": 9,
+        "warning_count": 3,
+    }
+    with qtbot.waitSignal(up.export_done, timeout=1000) as sig:
+        proc.feed(json.dumps(payload))
+    assert sig.args[0] == ["/Game/A.uasset"]
+    assert sig.args[2] is True
+    assert sig.args[3] == 9
+    assert sig.args[4] == 3
+
+
+def test_export_done_defaults_when_cancellation_fields_missing(unpacker_with_stub, qtbot):
+    """Older CLI payloads (no fields) must still dispatch cleanly."""
+    up, proc = unpacker_with_stub
+    payload = {
+        "type": "export_done",
+        "succeeded": ["/Game/A.uasset"],
+        "failed": [],
+        "total": 1,
+    }
+    with qtbot.waitSignal(up.export_done, timeout=1000) as sig:
+        proc.feed(json.dumps(payload))
+    assert sig.args[2] is False
+    assert sig.args[3] == 0
+    assert sig.args[4] == 0
+
+
 def test_input_line_too_large_error_dispatches(unpacker_with_stub, qtbot):
     """The CLI's stdin line-cap surfaces as an error event (Phase 3.2)."""
     up, proc = unpacker_with_stub

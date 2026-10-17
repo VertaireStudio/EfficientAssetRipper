@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/exterminathan/EfficientAssetRipper?include_prereleases&sort=semver)](https://github.com/exterminathan/EfficientAssetRipper/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#download)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20x64-0078d4)](#download)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![Built with PySide6 + .NET 10](https://img.shields.io/badge/built%20with-PySide6%20%2B%20.NET%2010-512bd4)](#dependencies)
 
@@ -39,7 +39,7 @@ trademarks of Epic Games, Inc. in the United States and elsewhere.
 
 ## Features
 
-- **Asset Scanner** — Finds PSK/PSKX mesh files via [Everything SDK](https://www.voidtools.com/) with instant search across game directories
+- **Asset Scanner** — Finds PSK/PSKX mesh files via the [Everything SDK](https://www.voidtools.com/) (Windows) or the built-in file walker (Linux) with instant search across game directories
 - **Material Resolver** — Reads exported `.props.txt` metadata, follows material inheritance chains, and classifies textures by PBR slot (Base Color, Normal, ORM, Emissive, etc.)
 - **Automatic Blender Processing** — Headless Blender subprocess imports meshes, builds full shader node graphs with proper texture wiring, and saves `.blend` files
 - **VFS Unpacker** — Built-in [CUE4Parse](https://github.com/FabianFG/CUE4Parse) CLI mounts `.pak`/`.utoc` archives with AES decryption and exports meshes, textures, animations, audio, and material properties
@@ -87,9 +87,18 @@ Download the latest release from the [Releases](../../releases) page:
 **Requirements for the pre-built release:**
 
 - Windows 10/11 (x64)
-- [.NET 10.0 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) (for CUE4ParseCLI)
 - [Blender 4.0+](https://www.blender.org/download/) (for asset processing)
 - [Everything](https://www.voidtools.com/) (must be running for asset search)
+
+### Linux
+
+Run from source (see [Installation](#installation-from-source)) or build a
+standalone bundle with `./build.sh` (`dist/EfficientAssetRipper/`).
+Everything search falls back to the built-in walker; Blender detection
+covers the Blender.org install, distro packages, Flatpak, Snap, and Steam
+libraries (e.g.
+`~/.local/share/Steam/steamapps/common/Blender/blender`). QSettings data
+lives in `~/.config/EfficientAssetRipper/` instead of the Windows registry.
 
 ---
 
@@ -99,10 +108,10 @@ Download the latest release from the [Releases](../../releases) page:
 
 | Tool                                                         | Version | Purpose                                                        |
 | ------------------------------------------------------------ | ------- | -------------------------------------------------------------- |
-| [Python](https://python.org)                                 | 3.10+   | Application runtime                                            |
+| [Python](https://python.org)                                 | 3.11+   | Application runtime                                            |
 | [Blender](https://www.blender.org/download/)                 | 4.0+    | Headless mesh import & material wiring                         |
-| [Everything](https://www.voidtools.com/)                     | 1.4+    | Fast file search (must be running)                             |
-| [.NET SDK](https://dotnet.microsoft.com/download/dotnet/8.0) | 8.0+    | Build CUE4ParseCLI (optional — pre-built included in releases) |
+| [Everything](https://www.voidtools.com/) (Windows only)      | 1.4+    | Fast file search (must be running) — Linux ships a built-in walker fallback |
+| [.NET SDK](https://dotnet.microsoft.com/download/dotnet/10.0)| 10.0+   | Build CUE4ParseCLI (optional — pre-built included in releases) |
 
 ### Steps
 
@@ -170,11 +179,12 @@ EfficientAssetRipper requires a PSK import addon in Blender. The default is the 
    appears. The first-run wizard auto-detects Blender, Everything, and
    .NET if they're installed.
 2. **Configure global tooling paths** in **Settings**:
-   - **Blender** — path to `blender.exe`
-   - **Everything DLL** — path to `Everything64.dll` (usually
-     `C:\Program Files\Everything\Everything64.dll`)
-   - **CUE4Parse CLI** — path to `CUE4ParseCLI.exe` (in
-     `cue4parse_cli/bin/publish/`)
+   - **Blender** — path to the Blender executable (auto-detected on both
+     Windows and Linux, including Steam/Flatpak/Snap installs)
+   - **Everything DLL** — path to `Everything64.dll`, Windows only
+     (usually `C:\Program Files\Everything\Everything64.dll`)
+   - **CUE4Parse CLI** — path to the published CLI binary (`CUE4ParseCLI.exe`
+     on Windows, `CUE4ParseCLI` on Linux; in `cue4parse_cli/bin/publish/`)
 3. **Create a game profile** in **Manage Profiles**:
    - **Game folder** — path to the game's content/pak directory
    - **UE Version** — `GAME_UE5_4` is a sane default; pick the closest
@@ -212,9 +222,25 @@ reports.
 
 ## Building an EXE
 
-A build script is included to package the application as a standalone Windows executable.
+A build script is included to package the application as a standalone
+executable — on Windows (`build.bat`) and Linux (`build.sh`).
 
-### Quick Build
+### Quick Build (Linux)
+
+```bash
+./build.sh
+```
+
+This will:
+
+1. Install PyInstaller if needed
+2. Run the fast test tiers (same gate as build.bat)
+3. Build the Python application into a `dist/EfficientAssetRipper/` directory
+4. Copy data files (blender scripts, texture presets, fonts)
+5. Build CUE4ParseCLI (if the .NET 10 SDK is installed)
+6. Create `dist/EfficientAssetRipper-linux-x64.zip` (or `.tar.gz` without `zip`)
+
+### Quick Build (Windows)
 
 ```bash
 build.bat
@@ -276,9 +302,10 @@ Total runtime is ~10 seconds.
 ### Run specific tiers
 
 ```bash
-py -m pytest tests/unit            # ~1s, pure logic, no I/O
-py -m pytest tests/integration     # ~1s, real fixtures + disk I/O
-py -m pytest tests/qt              # ~10s, PySide6 widgets via pytest-qt
+python -m pytest tests/unit            # ~1s, pure logic, no I/O
+python -m pytest tests/integration     # ~1s, real fixtures + disk I/O
+python -m pytest tests/qt              # ~10s, PySide6 widgets via pytest-qt
+```
 ```
 
 ### Run a single test file or test
@@ -331,15 +358,18 @@ EfficientAssetRipper/
 ├── _base.py                 # Base directory resolver (source & frozen exe)
 ├── config.py                # QSettings-based configuration
 ├── requirements.txt         # Python dependencies
-├── build.bat                # Windows exe build script
-├── build_cli.bat            # CUE4ParseCLI build script (Windows)
-├── build_cli.sh             # CUE4ParseCLI build script (Linux/macOS)
+├── build.bat                 # Windows exe build script
+├── build_cli.bat             # CUE4ParseCLI build script (Windows)
+├── build_cli.sh              # CUE4ParseCLI build script (Linux/macOS)
+├── build.sh                  # Linux build script (PyInstaller bundle)
 │
 ├── core/                    # Backend logic
 │   ├── asset_scanner.py     # Asset discovery & material resolution
 │   ├── blender_runner.py    # Headless Blender subprocess wrapper
 │   ├── classifier.py        # Asset categorization by folder path
 │   ├── everything.py        # Everything SDK ctypes wrapper
+│   ├── file_search.py       # Built-in walker fallback (Linux / no Everything)
+│   ├── tools_detect.py      # Platform-aware Blender / CLI / DLL detection
 │   ├── job_manager.py       # Batch processing queue (QThread)
 │   ├── profile_manager.py   # Per-game profile CRUD
 │   ├── props_parser.py      # UE .props.txt parser (JSON + legacy text)
@@ -422,7 +452,7 @@ The built-in CLI tool communicates via NDJSON (newline-delimited JSON) over stdi
 
 ## Configuration
 
-Settings are stored in the Windows registry via QSettings (`HKCU\Software\EfficientAssetRipper`). Per-game profiles are saved as JSON files in the `profiles/` directory.
+Settings are stored via QSettings — the Windows registry (`HKCU\Software\EfficientAssetRipper`) on Windows, or an INI file (`~/.config/EfficientAssetRipper/EfficientAssetRipper.ini`) on Linux. Per-game profiles are saved as JSON files in the `profiles/` directory.
 
 Key settings:
 
@@ -448,9 +478,9 @@ Key settings:
 ### External Tools
 
 - [Blender](https://www.blender.org/) 4.0+ — Headless PSK import and shader node construction
-- [Everything](https://www.voidtools.com/) — Windows file search (must be running)
-- [.NET 10.0 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) — Required for CUE4ParseCLI
-- [vgmstream](https://vgmstream.org/) — WEM audio conversion (auto-downloaded by CUE4ParseCLI)
+- [Everything](https://www.voidtools.com/) — Windows file search (must be running); other platforms use the built-in walker
+- [.NET 10.0 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) — Required for CUE4ParseCLI (bundled self-contained in releases; needed to rebuild from source)
+- [vgmstream](https://vgmstream.org/) — WEM audio conversion (auto-downloaded by CUE4ParseCLI for both Windows and Linux)
 
 ---
 

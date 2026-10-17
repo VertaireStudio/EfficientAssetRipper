@@ -23,5 +23,13 @@
     <PackageReference Include="CUE4Parse" Version="1.2.2.202607" />
     <PackageReference Include="CUE4Parse-Conversion" Version="1.2.2.202607" />
     <PackageReference Include="Newtonsoft.Json" Version="13.*" />
+    <!-- The SkiaSharp meta-package CUE4Parse-Conversion pulls in ships
+         Windows/macOS native assets only; without a Linux native asset the
+         texture decode path fails on Linux with "Unable to load
+         libSkiaSharp". NoDependencies avoids a hard fontconfig dependency
+         (the CLI doesn't render text). Linux-only payloads — irrelevant on
+         a Windows publish, matching version pinned to CUE4Parse-Conversion's
+         SkiaSharp (2.88.9). -->
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
   </ItemGroup>
 </Project>

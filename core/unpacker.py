@@ -32,7 +32,7 @@ class UnpackerProcess(QObject):
     initialized = Signal(int, int, int, int, int, list)  # archive_count, unmounted_count, file_count, keys_submitted, loose_file_count, unmounted_archives
     browse_result = Signal(str, list)         # path, list[dict{name, is_folder}]
     progress = Signal(int, int, str)          # current, total, message
-    export_done = Signal(list, list)          # succeeded: list[str], failed: list[dict]
+    export_done = Signal(list, list, bool, int, int)  # succeeded, failed, cancelled, remaining, warning_count
     props_result = Signal(str, list)          # path, list[dict{name, export_type, properties}]
     exports_listed = Signal(str, list, str)   # path, list[dict{name, export_type, outer}], error ("" if none)
     wwise_scan_result = Signal(dict)          # full scan result dict
@@ -315,6 +315,9 @@ class UnpackerProcess(QObject):
             self.export_done.emit(
                 msg.get("succeeded", []),
                 msg.get("failed", []),
+                bool(msg.get("cancelled", False)),
+                int(msg.get("remaining", 0)),
+                int(msg.get("warning_count", 0)),
             )
 
         elif msg_type == "props_result":

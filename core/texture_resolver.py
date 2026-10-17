@@ -84,23 +84,29 @@ def _pick_closest_path(candidates: list[Path], reference: Path) -> Path:
 
     Ties are broken deterministically by ``(len(parts), str(c).lower())`` so
     that scan order or filesystem enumeration order does not change the
-    result.
+    result. Prefix comparison is separator-agnostic: cached Windows-style
+    backslash paths must still prefix-match against POSIX reference paths
+    (and vice versa), so paths are normalised to forward-slash parts.
     """
     if len(candidates) == 1:
         return candidates[0]
 
-    ref_parts = reference.parts
+    ref_norm = str(reference).replace("\\", "/")
+    ref_parts = tuple(p for p in ref_norm.split("/") if p)
+
+    def norm_parts(p: Path) -> tuple[str, ...]:
+        return tuple(part for part in str(p).replace("\\", "/").split("/") if part)
 
     # No reference to compare against — pick the shortest/lexicographically-first.
     if not ref_parts:
         return sorted(
-            candidates, key=lambda c: (len(c.parts), str(c).lower())
+            candidates, key=lambda c: (len(norm_parts(c)), str(c).lower())
         )[0]
 
     scored: list[tuple[int, Path]] = []
     for c in candidates:
         score = 0
-        for a, b in zip(c.parts, ref_parts):
+        for a, b in zip(norm_parts(c), ref_parts):
             if a.lower() == b.lower():
                 score += 1
             else:
@@ -111,7 +117,7 @@ def _pick_closest_path(candidates: list[Path], reference: Path) -> Path:
     tied = [c for s, c in scored if s == best_score]
     if len(tied) == 1:
         return tied[0]
-    return sorted(tied, key=lambda c: (len(c.parts), str(c).lower()))[0]
+    return sorted(tied, key=lambda c: (len(norm_parts(c)), str(c).lower()))[0]
 
 
 def classify_texture(

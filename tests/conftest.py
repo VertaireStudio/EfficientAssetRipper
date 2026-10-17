@@ -366,16 +366,31 @@ def _has_blender() -> bool:
     candidate = os.environ.get("BLENDER_EXE")
     if candidate and Path(candidate).is_file():
         return True
-    return shutil.which("blender") is not None
+    if shutil.which("blender") is not None:
+        return True
+    # Platform-aware fallback (flatpak, snap, Steam libraries, …)
+    try:
+        from core.tools_detect import detect_blender
+    except Exception:
+        return False
+    return detect_blender() != ""
 
 
 def _has_dotnet_cli() -> bool:
     candidate = os.environ.get("CUE4PARSE_CLI")
     if candidate and Path(candidate).is_file():
         return True
-    # Default in-tree publish path
-    default = Path(__file__).resolve().parent.parent / "cue4parse_cli" / "bin" / "publish" / "CUE4ParseCLI.exe"
-    return default.is_file()
+    # Default in-tree publish path (platform-dependent binary name)
+    try:
+        from core.tools_detect import bundled_cue4parse_cli
+    except Exception:
+        name = "CUE4ParseCLI.exe" if sys.platform == "win32" else "CUE4ParseCLI"
+        default = (
+            Path(__file__).resolve().parent.parent
+            / "cue4parse_cli" / "bin" / "publish" / name
+        )
+        return default.is_file()
+    return bundled_cue4parse_cli().is_file()
 
 
 def _has_everything_dll() -> bool:

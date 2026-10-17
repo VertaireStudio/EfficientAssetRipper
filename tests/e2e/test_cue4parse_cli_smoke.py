@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -22,7 +23,8 @@ def _resolve_cli() -> str:
     if cli and Path(cli).is_file():
         return cli
     repo_root = Path(__file__).resolve().parent.parent.parent
-    default = repo_root / "cue4parse_cli" / "bin" / "publish" / "CUE4ParseCLI.exe"
+    name = "CUE4ParseCLI.exe" if sys.platform == "win32" else "CUE4ParseCLI"
+    default = repo_root / "cue4parse_cli" / "bin" / "publish" / name
     return str(default)
 
 
