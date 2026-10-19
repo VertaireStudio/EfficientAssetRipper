@@ -5,7 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9-VS.2] - 2026-10-19
+
+Parallel GPU-accelerated exports with a memory budget, new export formats
+(glTF / FBX / WebP / MP3 / WebM), instant cancel with memory reclaim.
+
+### Added
+- GPU texture decode — block-compressed formats (BC1/BC3/BC4/BC5/BC7 and
+  ASTC LDR) decode on the graphics card through Vulkan's fixed-function
+  sampler instead of handwritten compute kernels — one code path covers
+  Windows and Linux. Per-texture failures fall back to the CPU decoder,
+  a failed init marks the GPU unavailable for the session, and texture
+  outputs stay byte-comparable with plain CPU runs. The mode is a new
+  Auto/On/Off setting, the mount-time status ("enabled — <device>") is
+  surfaced in the unpacker log, and the implementation is pure P/Invoke
+  against the driver's Vulkan loader, so no GPU driver just means the
+  CPU fallback.
+- Parallel multi-threaded export — the worker count is configurable in
+  Settings (Auto = one worker per CPU core); the CLI sizes a bounded
+  serialize-thread pool so N workers never dead-lock the serializer,
+  mounted VFS readers are forced concurrently readable before export,
+  and progress emission is rate-limited so a 16-worker run doesn't
+  flood stdout with per-asset lines.
+- Export memory policy enforced inside the CUE4Parse CLI, two layers:
+  - "Use only physical memory" — the exporter's working set never
+    leaves physical RAM (swap/page file never touched). Flips the CLI
+    to workstation GC (`DOTNET_gcServer=0`) on the next mount,
+    relaunching the CLI when the setting changes on a running one.
+  - Memory Limit (0–95 % of the RAM currently free) — the percentage is
+    applied to available RAM at each export start (not total RAM), with the
+    exporter's own resident footprint added back so consecutive exports
+    don't shrink each other's budget. The exporter stays under the
+    budget: the .NET GC itself is capped, workers back off near the
+    soft threshold, at the hard wall one rate-limited worker runs a
+    blocking compacting collection between batch barriers (then the
+    working set is trimmed), workers are shed/added adaptively from
+    live usage, and a stuck asset is skipped with a clear error after
+    a bounded wait instead of hanging the run.
+  - Settings shows the resolved budget ("Exporter budget ≈ 6.0 GB of
+    12.1 GB RAM currently free") using dependency-free physical RAM
+    detection that quietly hides the hint where the platform can't be
+    probed.
+- Three new mesh output formats in Settings → psk / glb / fbx: glTF
+  2.0 binary (`.glb`) is produced directly by the CLI; FBX is a
+  two-step path — the CLI exports PSKs (it has no FBX writer) and a
+  new headless-Blender worker converts each newly-written PSK through
+  the same Blender runner the .blend pipeline uses (sequential,
+  cancel-terminates the live Blender subtree, tracked on shutdown).
+  FBX output keeps the armature unstripped so rigs and skin weights
+  survive, skips material wiring for geometry-only batches, and
+  exports atomically. glTF/FBX files preview by opening the system
+  default app rather than the PSK-only built-in viewer.
+- WebP texture export (png / tga / webp) with a lossless
+  (pixel-exact) mode and a lossy mode with a configurable quality
+  slider; the built-in TGA/image previewer accepts `.webp`.
+- MP3 and WebM audio export targets — ffmpeg is auto-downloaded
+  (hash-pinned, cached once per session cache dir), extracted
+  zip-slip-checked on Windows and via the system `tar` `.tar.xz` on
+  Linux, and the produced binary is marked executable on Linux.
+- Large payloads stream straight to disk instead of buffering whole in
+  managed memory — WWise `.wem` dumps and video exports (direct leaves
+  and resolved `FileMediaSource` paths alike) write through a streaming
+  copy, so multi-GB cutscenes never exist whole inside the CLI's heap.
+- CUE4ParseCLI publish-readying: ReadyToRun precompile (every GUI
+  session spawns a fresh CLI before mounting, so startup matters),
+  tiered PGO, server GC sized for the parallel workers, and invariant
+  globalization to skip the runtime ICU initializer.
+
+### Changed
+- WWise and FMOD audio exports keep their own configured worker count
+  instead of clobbering the global serialize-thread cap (they can run
+  concurrently with a queued export/scan).
+- Video entries no longer burn a progress slot when the per-entry
+  memory-gate timeout skips them — the count and the summary now agree.
+
+### Fixed
+- Cancellation is immediate, not "between batches": the cancel token is
+  wired into the parallel export loop, so the scheduler stops
+  dispatching the moment cancel lands instead of draining the
+  remaining 64-asset batch one early-return at a time (in-flight
+  assets still finish — up to a couple of seconds). The final
+  `export_done` (cancelled + remaining) is guaranteed even when a
+  mid-batch cancel aborts the loop, so the panel never hangs in
+  "Cancelling...".
+- Progress memory is reclaimed right after every export, not left for
+  whenever the idle process next GCs: a one-shot large-object-heap
+  compaction plus a double compacting collection returns decoded pixel
+  buffers and mesh LOD arrays, then the working set is trimmed so the
+  OS sees the pages freed. A cancelled run discards its in-progress
+  decode work with it.
+- The GUI discards the progress bar on a cancelled run instead of
+  leaving it parked at the last partial value, which would read as
+  real progress; a replaced cancellation source is disposed rather
+  than left to finalize later.
+- Log viewer "Copy to clipboard" is bounded to the in-memory log cap,
+  so a huge session cannot build a runaway clipboard string when the
+  visible log has already capped its entries.
+- The Blender worker saves/exports atomically — output goes to a
+  `.tmp` file that is replaced on success, and a zero-length output
+  aborts instead of "succeeding" with a corrupt file.
+
+## [0.9-VS.1] - 2026-10-18
+
+Linux platform support — the full pipeline runs on Linux x64 — plus
+FMOD audio, better tool detection, and honest-er exports.
 
 ### Added
 - Linux platform support. The app, its Qt UI, and the full

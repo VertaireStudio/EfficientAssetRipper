@@ -174,8 +174,16 @@ class LogViewer(QWidget):
         self._alert_label.setText("")
 
     def _copy_log(self):
-        text = "\n".join(msg for msg, _ in self._entries)
-        QApplication.clipboard().setText(text)
+        # Build the clipboard payload line-by-line and stop at the entry
+        # cap: `_entries` is already bounded to _MAX_LOG_ENTRIES, so this
+        # transient string can never exceed _MAX_LOG_ENTRIES lines even
+        # mid-loop.
+        lines: list[str] = []
+        for msg, _level in self._entries:
+            if len(lines) >= _MAX_LOG_ENTRIES:
+                break
+            lines.append(msg)
+        QApplication.clipboard().setText("\n".join(lines))
 
     def _save_log(self):
         path, _ = QFileDialog.getSaveFileName(

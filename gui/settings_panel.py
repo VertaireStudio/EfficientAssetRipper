@@ -14,6 +14,7 @@ from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -141,23 +142,110 @@ class SettingsDialog(QDialog):
         self.timeout.setValue(config.get_int("timeout_seconds") or 120)
         proc_form.addRow("Timeout per Asset:", self.timeout)
 
+        self.export_threads = QSpinBox()
+        self.export_threads.setRange(0, 64)
+        self.export_threads.setSpecialValueText("Auto (all cores)")
+        self.export_threads.setValue(config.get_int("unpacker_export_threads"))
+        self.export_threads.setToolTip(
+            "Parallel export workers inside the CUE4Parse CLI. "
+            "Auto uses one worker per CPU core. Lower this if exports "
+            "use too much memory or destabilize on this machine."
+        )
+        proc_form.addRow("Export Threads:", self.export_threads)
+
+        self.gpu_accel = QComboBox()
+        self.gpu_accel.addItems(["Auto", "On", "Off"])
+        self.gpu_accel.setCurrentText(config.get("unpacker_gpu_accel").capitalize())
+        self.gpu_accel.setToolTip(
+            "Texture decode on the graphics card (Vulkan). Auto uses the GPU "
+            "when one is available and falls back to CPU otherwise. Result "
+            "is shown in the unpacker log at mount time."
+        )
+        proc_form.addRow("GPU Decode:", self.gpu_accel)
+
+        # --- Export memory policy (enforced inside the CUE4Parse CLI) ---
+        self.physical_memory_only = QCheckBox("Use only physical memory")
+        stored_physical = config.get_raw("unpacker_physical_memory_only")
+        self.physical_memory_only.setChecked(
+            stored_physical in (True, "true", "True", 1))
+        self.physical_memory_only.setToolTip(
+            "Keep the exporter inside physical RAM — it never relies on "
+            "swap/page file, pausing when the machine comes under memory "
+            "pressure. Takes effect on the next Mount (the CLI is "
+            "relaunched with a smaller-footprint garbage collector)."
+        )
+        proc_form.addRow("", self.physical_memory_only)
+
+        self.memory_limit = QSpinBox()
+        self.memory_limit.setRange(0, 95)
+        self.memory_limit.setSpecialValueText("Unlimited")
+        self.memory_limit.setSuffix(" %")
+        try:
+            self.memory_limit.setValue(int(config.get("unpacker_memory_limit_percent") or 0))
+        except (TypeError, ValueError):
+            self.memory_limit.setValue(0)
+        self.memory_limit.setToolTip(
+            "Hard budget for an export run as a percentage of the RAM that "
+            "is currently free — not total RAM — measured when each export "
+            "starts (the exporter's own resident pages are not counted "
+            "against you). Workers pause above the soft threshold and "
+            "assets are skipped with a clear error if the limit can't be "
+            "met. 0 = unlimited. Applies from the next export."
+        )
+        proc_form.addRow("Memory Limit:", self.memory_limit)
+
+        self.memory_hint = QLabel()
+        self.memory_hint.setWordWrap(True)
+        proc_form.addRow("", self.memory_hint)
+        self.memory_limit.valueChanged.connect(self._refresh_memory_hint)
+        self.physical_memory_only.toggled.connect(self._refresh_memory_hint)
+        self._refresh_memory_hint()
+
         # --- Export Formats group ---
         fmt_section = CollapsibleSection("Export Formats", start_expanded=True)
         fmt_form = QFormLayout()
 
         self.texture_format = QComboBox()
-        self.texture_format.addItems(["png", "tga"])
+        self.texture_format.addItems(["png", "tga", "webp"])
         self.texture_format.setCurrentText(config.get("export_texture_format"))
         fmt_form.addRow("Textures:", self.texture_format)
 
+        # WebP tuning — only meaningful when webp is the texture format; the
+        # spin box stays populated so switching back preserves the value.
+        self.webp_mode = QComboBox()
+        self.webp_mode.addItems(["lossless", "lossy"])
+        self.webp_mode.setCurrentText(str(config.get("export_texture_webp_mode")))
+        self.webp_mode.currentTextChanged.connect(self._on_webp_mode_changed)
+        self.webp_quality = QSpinBox()
+        self.webp_quality.setRange(1, 100)
+        self.webp_quality.setValue(int(config.get("export_texture_webp_quality")))
+        self.webp_quality.setSuffix(" %")
+        self.webp_quality.setToolTip(
+            "Lossy WebP quality. Ignored in lossless mode "
+            "(lossless output is bit-exact at any setting)."
+        )
+        fmt_form.addRow("WebP mode:", self.webp_mode)
+        fmt_form.addRow("WebP quality:", self.webp_quality)
+        self.texture_format.currentTextChanged.connect(self._on_texture_format_changed)
+
         self.audio_format = QComboBox()
-        self.audio_format.addItems(["wav", "ogg"])
+        self.audio_format.addItems(["wav", "ogg", "mp3", "webm"])
         self.audio_format.setCurrentText(config.get("export_audio_format"))
         fmt_form.addRow("Audio:", self.audio_format)
 
-        mesh_label = QLabel("PSK / PSKX (automatic)")
-        fmt_form.addRow("Meshes:", mesh_label)
+        self.mesh_format = QComboBox()
+        self.mesh_format.addItems(["psk", "glb", "fbx"])
+        self.mesh_format.setCurrentText(config.get("export_mesh_format") or "psk")
+        fmt_form.addRow("Meshes:", self.mesh_format)
+        mesh_hint = QLabel(
+            "psk = PSK/PSKX (fastest)\n"
+            "glb = glTF 2.0 binary, untextured\n"
+            "fbx = exports PSK then converts through Blender (more meshes = slower)"
+        )
+        mesh_hint.setWordWrap(True)
+        fmt_form.addRow("", mesh_hint)
 
+        self._on_texture_format_changed(self.texture_format.currentText())
         fmt_section.set_content_layout(fmt_form)
         layout.addWidget(fmt_section)
 
@@ -256,6 +344,27 @@ class SettingsDialog(QDialog):
     # folder fields all moved to per-profile JSON).
     _PATH_FIELDS_FILE = ("blender_exe", "everything_dll", "cue4parse_cli")
 
+    # Mesh-format values stored in config (the combo shows the same tokens).
+    _MESH_FORMATS = ("psk", "glb", "fbx")
+
+    def _on_texture_format_changed(self, fmt: str):
+        """Enable the WebP tuning widgets only when webp is selected."""
+        is_webp = fmt.lower() == "webp"
+        self.webp_mode.setEnabled(is_webp)
+        self.webp_quality.setEnabled(is_webp and self.webp_mode.currentText() == "lossy")
+
+    def _on_webp_mode_changed(self, mode: str):
+        self.webp_quality.setEnabled(self.texture_format.currentText().lower() == "webp" and mode == "lossy")
+
+    def _refresh_memory_hint(self):
+        """Update the absolute-budget hint line under the memory widgets."""
+        from core import memory_info
+        label = memory_info.budget_label(
+            self.memory_limit.value(),
+            self.physical_memory_only.isChecked(),
+        )
+        self.memory_hint.setText(label or "")
+
     def _confirm_missing_path(self, label: str, value: str) -> bool:
         """Prompt the user when a path is set but doesn't exist on disk."""
         reply = QMessageBox.question(
@@ -322,9 +431,19 @@ class SettingsDialog(QDialog):
         config.set("presets_path", new_presets)
         config.set("psk_addon_name", self.addon_name.text())
         config.set("timeout_seconds", self.timeout.value())
+        config.set("unpacker_export_threads", self.export_threads.value())
+        config.set("unpacker_physical_memory_only", self.physical_memory_only.isChecked())
+        config.set("unpacker_memory_limit_percent", self.memory_limit.value())
+        config.set("unpacker_gpu_accel", self.gpu_accel.currentText().lower())
         config.set("cue4parse_cli", self.cue4parse_cli.text())
         config.set("export_texture_format", self.texture_format.currentText())
+        config.set("export_texture_webp_mode", self.webp_mode.currentText())
+        config.set("export_texture_webp_quality", self.webp_quality.value())
         config.set("export_audio_format", self.audio_format.currentText())
+        # Combo text doubles as the stored token ("psk"/"glb"/"fbx"); anything
+        # else can only come from a corrupted QSettings load — keep psk.
+        mesh_token = self.mesh_format.currentText().strip().lower()
+        config.set("export_mesh_format", mesh_token if mesh_token in self._MESH_FORMATS else "psk")
 
         config.set("ui_scale", self.ui_scale.value())
         theme.set_ui_scale(self.ui_scale.value() / 100.0)
@@ -369,8 +488,15 @@ class SettingsDialog(QDialog):
         self.cue4parse_cli.setText(defaults.get("cue4parse_cli", ""))
         self.addon_name.setText(defaults.get("psk_addon_name", ""))
         self.timeout.setValue(int(defaults.get("timeout_seconds", 120)))
+        self.export_threads.setValue(int(defaults.get("unpacker_export_threads", 0)))
+        self.physical_memory_only.setChecked(bool(defaults.get("unpacker_physical_memory_only", False)))
+        self.memory_limit.setValue(int(defaults.get("unpacker_memory_limit_percent", 0)))
+        self.gpu_accel.setCurrentText(str(defaults.get("unpacker_gpu_accel", "auto")).capitalize())
         self.texture_format.setCurrentText(defaults.get("export_texture_format", "png"))
+        self.webp_mode.setCurrentText(defaults.get("export_texture_webp_mode", "lossless"))
+        self.webp_quality.setValue(int(defaults.get("export_texture_webp_quality", 90)))
         self.audio_format.setCurrentText(defaults.get("export_audio_format", "wav"))
+        self.mesh_format.setCurrentText(defaults.get("export_mesh_format", "psk"))
         self.ui_scale.setValue(int(defaults.get("ui_scale", 100)))
 
     # ------------------------------------------------------------------

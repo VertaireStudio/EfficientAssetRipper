@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/cellegen/Documents/GitHub/EfficientAssetRipper/main.py", line 6, in <module>
+    from PySide6.QtWidgets import QApplication
+ModuleNotFoundError: No module named 'PySide6'

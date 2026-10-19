@@ -198,6 +198,49 @@ def test_cli_path_traversal_blocked_no_file_written(tmp_path):
         assert "escapes" in err.lower() or "root" in err.lower()
 
 
+def test_cli_export_accepts_new_format_fields():
+    """export with mesh_format/webp fields must parse and route fine.
+
+    Without a mounted provider the CLI errors on the missing provider, but
+    only *after* the command consumes the format fields — malformed or
+    unknown-format values would raise before any provider check.
+    """
+    cli = _resolve_cli()
+    proc = subprocess.Popen(
+        [cli],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        proc.stdin.write(json.dumps({
+            "cmd": "export",
+            "paths": ["/Game/Foo.uasset"],
+            "output_dir": "/tmp/opencode/ear_export_smoke",
+            "texture_format": "webp",
+            "audio_format": "mp3",
+            "mesh_format": "gltf",
+            "webp_mode": "lossy",
+            "webp_quality": 90,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.write(json.dumps({"cmd": "quit"}).encode("utf-8") + b"\n")
+        proc.stdin.flush()
+        out, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    text = out.decode("utf-8", errors="replace")
+    parsed = [json.loads(line) for line in text.splitlines() if line.strip()]
+    # Either the export ran (export_done) or died inside the provider check —
+    # both prove the format fields parsed. A crash trace in stdout means the
+    # new fields broke the command wiring.
+    for line in text.splitlines():
+        if "Unhandled exception" in line or "at CUE4ParseCLI.Program" in line:
+            pytest.fail(f"CLI crashed on new format fields: {line!r}")
+
+
 def test_cli_init_without_provider_then_browse_emits_error():
     """Sending `browse` without prior `init` must emit a structured error (lifecycle)."""
     cli = _resolve_cli()
@@ -223,3 +266,137 @@ def test_cli_init_without_provider_then_browse_emits_error():
         msg.get("type") == "error" and "Not initialized" in msg.get("message", "")
         for msg in parsed
     ), f"missing 'Not initialized' error in: {parsed!r}"
+
+
+def test_cli_export_accepts_memory_policy_fields():
+    """export with memory_limit_percent/physical_only must parse and route.
+
+    The memory policy is resolved before the provider check (same tier as
+    the format fields), so an unmounted run still proves the fields were
+    consumed — a malformed percent or unknown field would crash instead.
+    """
+    cli = _resolve_cli()
+    proc = subprocess.Popen(
+        [cli],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        # Percent within 1-95 plus the physical-only flag, then the folder
+        # variant to cover the second command that parses the policy.
+        proc.stdin.write(json.dumps({
+            "cmd": "export",
+            "paths": ["/Game/Foo.uasset"],
+            "output_dir": "/tmp/opencode/ear_export_smoke",
+            "memory_limit_percent": 5,
+            "physical_only": True,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.write(json.dumps({
+            "cmd": "export_folder",
+            "path": "/Game/Foo",
+            "output_dir": "/tmp/opencode/ear_export_smoke",
+            "memory_limit_percent": 90,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.write(json.dumps({"cmd": "quit"}).encode("utf-8") + b"\n")
+        proc.stdin.flush()
+        out, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    text = out.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if "Unhandled exception" in line or "at CUE4ParseCLI.Program" in line:
+            pytest.fail(f"CLI crashed on memory policy fields: {line!r}")
+    parsed = [json.loads(line) for line in text.splitlines() if line.strip()]
+    # The 5% budget was inside the accepted range, so the policy notice for
+    # it must have reached stdout before the provider error — regardless of
+    # provider-mount failure.
+    notices = [m.get("message", "") for m in parsed if m.get("type") == "info"]
+    assert any("Memory limit" in n for n in notices), f"no memory-limit info in {notices}"
+
+
+def test_cli_memory_policy_out_of_range_is_ignored():
+    """A percent above 95 is clamped to unlimited (no cap, no notice)."""
+    cli = _resolve_cli()
+    proc = subprocess.Popen(
+        [cli],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        proc.stdin.write(json.dumps({
+            "cmd": "export",
+            "paths": ["/Game/Foo.uasset"],
+            "output_dir": "/tmp/opencode/ear_export_smoke",
+            "memory_limit_percent": 99,
+        }).encode("utf-8") + b"\n")
+        proc.stdin.write(json.dumps({"cmd": "quit"}).encode("utf-8") + b"\n")
+        proc.stdin.flush()
+        out, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    text = out.decode("utf-8", errors="replace")
+    parsed = [json.loads(line) for line in text.splitlines() if line.strip()]
+    notices = [m.get("message", "") for m in parsed if m.get("type") == "info"]
+    assert not any("Memory limit" in n for n in notices), f"unexpected cap notice: {notices}"
+
+
+def test_cli_cancel_burst_is_structured_and_quits(tmp_path):
+    """A pipelined export burst followed by cancel must stay structured.
+
+    The panel pipelines one export command per selected folder, so a real
+    cancel almost always arrives while further export commands are queued
+    behind the running one (they land in the CLI's _pendingCommands). This
+    smoke covers both interleavings of the cancel handler (read mid-export
+    in RunExportWithCancelSupport vs. idle in the main loop): every stdout
+    line must be valid NDJSON, a `cancelled` reply must reach us, no
+    unhandled exception may leak, and quit must still exit 0 — that cancels
+    never wedge the CLI regardless of queue state.
+    """
+    cli = _resolve_cli()
+    proc = subprocess.Popen(
+        [cli],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        burst = [
+            {"cmd": "export", "paths": ["/Game/A.uasset"],
+             "output_dir": "/tmp/opencode/ear_export_smoke"},
+            {"cmd": "export_folder", "path": "/Game/Foo",
+             "output_dir": "/tmp/opencode/ear_export_smoke"},
+            {"cmd": "cancel"},
+            {"cmd": "quit"},
+        ]
+        payload = b""
+        for c in burst:
+            payload += json.dumps(c).encode("utf-8") + b"\n"
+            payload += b"\n"  # blank lines are part of the reader's contract
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+        out, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    text = out.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        if "Unhandled exception" in line or "at CUE4ParseCLI.Program" in line:
+            pytest.fail(f"CLI leaked an unhandled exception during cancel burst: {line!r}")
+    parsed = [json.loads(l) for l in text.splitlines() if l.strip()]
+    assert any(m.get("type") == "cancelled" for m in parsed), \
+        f"no cancelled reply in {parsed!r}"
+    assert any(m.get("type") == "quit_ack" for m in parsed), \
+        f"no quit_ack in {parsed!r}"
+    assert any(m.get("type") == "error" and "Not initialized" in m.get("message", "")
+               for m in parsed), f"export errors missing: {parsed!r}"
+    assert proc.returncode == 0

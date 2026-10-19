@@ -441,12 +441,16 @@ The built-in CLI tool communicates via NDJSON (newline-delimited JSON) over stdi
 
 - **Archive mounting** with AES key decryption
 - **VFS browsing** of game content directories
-- **Asset export**: Static/Skeletal Meshes (PSK/PSKX), Textures (PNG/TGA), Animations (PSA), Audio (WAV/OGG)
+- **Asset export**: Static/Skeletal Meshes (PSK/PSKX or glTF 2.0 `.glb`; FBX
+  via the headless-Blender converter), Textures (PNG/TGA/WebP), Animations
+  (PSA), Audio (WAV/OGG/MP3/WebM)
 - **Material property serialization** to JSON
 - **WWise audio** event scanning and WEM export with automatic naming
 - **FMOD audio** bank scanning with per-stream preview and WAV export
 - **Oodle decompression** (auto-downloads if needed)
 - **vgmstream integration** for WEM→WAV/OGG conversion
+- **ffmpeg integration** (auto-downloaded, hash-pinned, cached once) for the
+  MP3/WebM audio targets
 
 ---
 

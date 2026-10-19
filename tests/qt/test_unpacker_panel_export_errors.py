@@ -95,6 +95,23 @@ class TestExportFailurePopup:
         assert "cancelled" in panel._status_label.text()
         assert "9" in panel._status_label.text()
 
+    def test_export_done_cancelled_discards_progress_bar(self, panel):
+        """A cancelled run must blank the bar instead of leaving it stalled
+        at the last partial value the CLI reported."""
+        panel._progress.setRange(0, 100)
+        panel._progress.setValue(67)
+        panel._on_export_done(["Game/A"], [], cancelled=True, remaining=9)
+        # Qt's reset() marks the bar "no progress" via the -1 sentinel
+        # (distinct from value 0, which would imply a started-but-empty run).
+        assert panel._progress.value() == -1
+
+    def test_export_done_success_fills_progress_bar(self, panel):
+        """A normal completion still fills the bar from the result counts."""
+        panel._progress.setRange(0, 100)
+        panel._progress.setValue(10)
+        panel._on_export_done(["Game/A"], [])
+        assert panel._progress.value() == panel._progress.maximum()
+
     def test_export_done_cancelled_with_failures_no_popup(self, panel, mocker):
         spy = mocker.patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Ok)
         panel._on_export_done(["Game/A"], [{"path": "x", "error": "boom"}],

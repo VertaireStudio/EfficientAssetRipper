@@ -35,7 +35,7 @@ except Exception:
 
 # Drag-accept and load-time recognition cover most texture formats CUE4Parse
 # emits — keep these in sync with `_IMAGE_EXTS` in unpacker_panel.
-_SUPPORTED_EXTS = (".tga", ".png", ".jpg", ".jpeg", ".bmp", ".dds")
+_SUPPORTED_EXTS = (".tga", ".png", ".jpg", ".jpeg", ".bmp", ".dds", ".webp")
 
 
 class _ImageLoadSignals(QObject):

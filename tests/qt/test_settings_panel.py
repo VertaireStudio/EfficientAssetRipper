@@ -81,6 +81,55 @@ def test_settings_dialog_save_writes_to_config(qtbot, mock_qsettings, monkeypatc
     assert config.get_int("timeout_seconds") == 300
 
 
+def test_settings_dialog_export_format_combos(qtbot, mock_qsettings):
+    """The format combos must expose every supported export format."""
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    assert [dlg.texture_format.itemText(i) for i in range(dlg.texture_format.count())] == [
+        "png", "tga", "webp"]
+    assert [dlg.audio_format.itemText(i) for i in range(dlg.audio_format.count())] == [
+        "wav", "ogg", "mp3", "webm"]
+    assert [dlg.mesh_format.itemText(i) for i in range(dlg.mesh_format.count())] == [
+        "psk", "glb", "fbx"]
+
+
+def test_settings_dialog_webp_widgets_enabled_state(qtbot, mock_qsettings):
+    """WebP mode/quality widgets gate on the selected texture format."""
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    # Default texture format is png — WebP tuning disabled…
+    assert not dlg.webp_mode.isEnabled()
+    dlg.texture_format.setCurrentText("webp")
+    assert dlg.webp_mode.isEnabled()
+    # …but the quality spin only matters in lossy mode.
+    assert not dlg.webp_quality.isEnabled()
+    dlg.webp_mode.setCurrentText("lossy")
+    assert dlg.webp_quality.isEnabled()
+
+
+def test_settings_dialog_save_persists_webp_and_mesh_format(qtbot, mock_qsettings, monkeypatch):
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    dlg.texture_format.setCurrentText("webp")
+    dlg.webp_mode.setCurrentText("lossy")
+    dlg.webp_quality.setValue(85)
+    dlg.audio_format.setCurrentText("mp3")
+    dlg.mesh_format.setCurrentText("glb")
+
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Yes),
+    )
+    dlg._save()
+
+    assert config.get("export_texture_format") == "webp"
+    assert config.get("export_texture_webp_mode") == "lossy"
+    assert config.get_int("export_texture_webp_quality") == 85
+    assert config.get("export_audio_format") == "mp3"
+    assert config.get("export_mesh_format") == "glb"
+
+
 def test_settings_dialog_save_aborts_on_missing_path_confirm_no(qtbot, mock_qsettings, monkeypatch):
     """Saying No to the missing-path prompt should abort the save."""
     dlg = SettingsDialog()
@@ -119,6 +168,7 @@ def test_reset_to_defaults_repopulates_widgets_without_saving(qtbot, mock_qsetti
     config.set("psk_addon_name", "stale.addon.name")
     config.set("timeout_seconds", 1234)  # in-range so the QSpinBox doesn't clamp
     config.set("export_texture_format", "tga")
+    config.set("export_mesh_format", "fbx")
 
     dlg = SettingsDialog()
     qtbot.addWidget(dlg)
@@ -137,6 +187,7 @@ def test_reset_to_defaults_repopulates_widgets_without_saving(qtbot, mock_qsetti
     assert dlg.addon_name.text() == config._DEFAULTS["psk_addon_name"]
     assert dlg.timeout.value() == config._DEFAULTS["timeout_seconds"]
     assert dlg.texture_format.currentText() == config._DEFAULTS["export_texture_format"]
+    assert dlg.mesh_format.currentText() == config._DEFAULTS["export_mesh_format"]
     # …but config still holds the stale values until the user clicks OK.
     assert config.get("psk_addon_name") == "stale.addon.name"
     assert config.get_int("timeout_seconds") == 1234
@@ -203,3 +254,71 @@ def test_settings_dialog_timeout_clamped(qtbot, mock_qsettings):
     assert dlg.timeout.value() <= 3600
     dlg.timeout.setValue(-50)
     assert dlg.timeout.value() >= 10
+
+
+# ---------------------------------------------------------------------------
+# Export memory policy — checkbox + percent spinbox (0 = Unlimited)
+# ---------------------------------------------------------------------------
+
+def test_memory_policy_widgets_exist_with_defaults(qtbot, mock_qsettings):
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+
+    assert dlg.physical_memory_only.isChecked() is False
+    assert dlg.memory_limit.minimum() == 0
+    assert dlg.memory_limit.maximum() == 95
+    assert dlg.memory_limit.value() == 0
+    assert dlg.memory_limit.specialValueText() == "Unlimited"
+    # No policy set → no absolute-budget hint is shown.
+    assert dlg.memory_hint.text() == ""
+
+
+def test_memory_policy_hint_shows_budget(qtbot, mock_qsettings, monkeypatch):
+    from core import memory_info
+    monkeypatch.setattr(memory_info, "total_bytes", lambda: 16 * 1024**3)
+    monkeypatch.setattr(memory_info, "available_bytes", lambda: 8 * 1024**3)
+
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+
+    dlg.memory_limit.setValue(50)
+    dlg.physical_memory_only.setChecked(False)
+    # 50% of the 8 GB currently free → 4.0 GB of 8.0 GB.
+    assert "4.0 GB of 8.0 GB" in dlg.memory_hint.text()
+
+    # Physical-only flips on → hint mentions the clamp.
+    dlg.physical_memory_only.setChecked(True)
+    assert dlg.memory_hint.text()
+
+
+def test_memory_policy_save_persists(qtbot, mock_qsettings, monkeypatch):
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    dlg.physical_memory_only.setChecked(True)
+    dlg.memory_limit.setValue(75)
+
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Yes),
+    )
+    dlg._save()
+
+    assert config.get_raw("unpacker_physical_memory_only") is True
+    assert config.get_int("unpacker_memory_limit_percent") == 75
+
+
+def test_memory_policy_reset_restores_defaults(qtbot, mock_qsettings, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Yes),
+    )
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    dlg.physical_memory_only.setChecked(True)
+    dlg.memory_limit.setValue(75)
+    dlg._reset_to_defaults()
+
+    assert dlg.physical_memory_only.isChecked() is False
+    assert dlg.memory_limit.value() == 0

@@ -9,8 +9,28 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>CUE4ParseCLI</AssemblyName>
     <RootNamespace>CUE4ParseCLI</RootNamespace>
+    <!-- Export throughput knobs: N parallel export workers allocate heavily
+         (decoded texture buffers, serialized UObject graphs) and Server GC
+         scales FGH across cores on both win-x64 and linux-x64. Higher
+         steady-state RAM is the accepted tradeoff. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- Explicit (default-on since .NET 8) so a future RuntimeTarget downgrade
+         does not silently lose profile-guided optimization. -->
+    <TieredPGO>true</TieredPGO>
+    <!-- The CLI never renders locale-formatted text and only ingests
+         parent-supplied JSON; skipping ICU on Linux avoids the runtime ICU
+         initializer entirely and shaves mount-time startup both platforms. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Publish-only: precompile framework + app assemblies (publishes always
+         pass -r <rid>). Startup matters because every GUI session spawns this
+         process fresh before the mount can begin. Keep single-file publish
+         uncompressed (default) — R2R plus EnableCompressionInSingleFile
+         regresses startup by re-decompressing the composite image every run
+         (dotnet/runtime#101866). Binary size grows roughly 30-50%. -->
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,5 +51,10 @@
          a Windows publish, matching version pinned to CUE4Parse-Conversion's
          SkiaSharp (2.88.9). -->
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
+    <!-- GPU texture decode (BC1-BC7/ASTC via the Vulkan fixed-function sampler,
+         see GpuTextureDecoder.cs). Pure P/Invoke against the platform loader:
+         vulkan-1.dll on Windows, libvulkan.so.1 on Linux — both ship with GPU
+         drivers, and absence just triggers the CPU fallback at runtime. -->
+    <PackageReference Include="Silk.NET.Vulkan" Version="2.23.0" />
   </ItemGroup>
 </Project>

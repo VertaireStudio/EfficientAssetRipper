@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QRunnable, QThread, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QByteArray, Qt, QRunnable, QThread, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -248,6 +249,43 @@ class MainWindow(QMainWindow):
         except ValueError:
             pass
 
+    def _on_fbx_requested(self, psks: list):
+        """Convert newly exported PSKs to .fbx with headless Blender.
+
+        Runs one Blender process per asset sequentially in a tracked worker
+        thread; cancel-safe (process tree terminated on cancel/shutdown).
+        """
+        from core.blender_runner import is_blender_available
+        from core.fbx_converter import FbxConversionWorker
+
+        if not is_blender_available():
+            self._log.append(
+                "FBX mesh export requested but Blender is not available — "
+                "PSK files kept as-is", "warning")
+            return
+
+        timeout = int(config.get_int("timeout_seconds") or 120)
+        worker = FbxConversionWorker(
+            [Path(p) for p in psks],
+            blender_exe=config.get("blender_exe") or "",
+            addon_name=config.get("psk_addon_name")
+                or "bl_ext.blender_org.io_scene_psk_psa",
+            timeout=timeout,
+        )
+        worker.log_message.connect(self._log.append)
+        worker.completed.connect(self._on_fbx_completed)
+        self._track_worker(worker)
+        worker.start()
+
+    def _on_fbx_completed(self, succeeded: int, failed: int, cancelled: bool):
+        if cancelled:
+            msg = f"FBX conversion cancelled: {succeeded} ok, {failed} failed"
+            self._log.append(msg, "warning")
+        else:
+            msg = f"FBX conversion: {succeeded} ok, {failed} failed"
+            self._log.append(msg, "success" if failed == 0 else "warning")
+        self._statusbar.showMessage(msg)
+
     def _maybe_run_setup_wizard(self):
         """Show the first-run wizard if it hasn't been completed yet."""
         from gui.setup_wizard import SetupWizard, should_show_setup
@@ -418,6 +456,7 @@ class MainWindow(QMainWindow):
         self._psk_picker.add_to_queue_requested.connect(self._add_picker_to_queue)
         self._psk_picker.mesh_preview_requested.connect(self._on_mesh_preview)
         self._unpacker_panel.psk_extracted.connect(self._on_psks_extracted)
+        self._unpacker_panel.fbx_requested.connect(self._on_fbx_requested)
         self._unpacker_panel.log_message.connect(self._log.append)
         self._unpacker_panel.version_mismatch.connect(self._log.show_alert)
         self._unpacker_panel.props_viewed.connect(self._show_in_text_viewer)
@@ -449,7 +488,18 @@ class MainWindow(QMainWindow):
         self._raise_dock(self._tga_previewer_dock)
 
     def _on_mesh_preview(self, path: str):
-        """Load .psk in the Mesh Preview dock and surface it."""
+        """Load .psk in the Mesh Preview dock and surface it.
+
+        glTF (.glb) / FBX exports preview externally: the built-in viewer is
+        a PSK parser, so anything else shows a hint instead of a parse error.
+        """
+        if not path.lower().endswith((".psk", ".pskx")):
+            self._log.append(
+                f"{Path(path).name}: glTF/FBX previews open in the system "
+                "default app (the built-in mesh viewer reads PSK only)", "info")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            self._raise_dock(self._mesh_previewer_dock)
+            return
         self._mesh_previewer.load_psk(path)
         self._raise_dock(self._mesh_previewer_dock)
 

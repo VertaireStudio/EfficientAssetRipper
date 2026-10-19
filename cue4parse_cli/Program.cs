@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -10,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.IO.Compression;
 using System.Net.Http;
+using System.Runtime;
 using System.Runtime.InteropServices;
 using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
@@ -47,15 +49,21 @@ internal static class Program
 {
     private static DefaultFileProvider? _provider;
     private static CancellationTokenSource _cts = new();
-    private static string _textureFormat = "png"; // png or tga
-    private static string _audioFormat = "wav";   // wav or ogg
+    private static string _textureFormat = "png"; // png | tga | webp
+    private static string _audioFormat = "wav";   // wav | ogg | mp3 | webm
+    private static string _meshFormat = "psk";    // psk | gltf
+    private static bool _webpLossless = true;     // WebP encode mode; lossless preserves pixel fidelity
+    private static int _webpQuality = 90;         // WebP quality 1-100 in lossy mode (ignored by lossless)
     private static string _gameDir = "";          // current game directory (for loose file reads)
     private static Dictionary<string, string> _looseFiles = new(StringComparer.OrdinalIgnoreCase); // VFS path → disk path for files CUE4Parse doesn't discover
     private static string? _vgmstreamPath;         // cached path to vgmstream-cli
+    private static string? _ffmpegPath;            // cached path to ffmpeg (MP3/WebM encoding)
+    private static readonly object _ffmpegInitLock = new(); // serializes the one-shot ffmpeg download
     private static Dictionary<string, string> _wemIdToName = new(StringComparer.OrdinalIgnoreCase); // WEM numeric ID → debug name
     private static Dictionary<string, string> _fmodBankCache = new(StringComparer.OrdinalIgnoreCase); // bank VFS path → materialized temp file
     private static string? _wemNameCachePath;       // per-game disk cache for WEM name map
     private static bool _wemMapBuilt;               // true once the map has been built/loaded this session
+    private static readonly object _wemMapLock = new(); // serializes the lazy WEM-map build across export workers
     private static Task? _exportTask;               // currently running export (if any)
     private static Task<string?>? _pendingReadTask;   // parked stdin read from RunExportWithCancelSupport
     private static readonly Queue<JObject> _pendingGetProps = new(); // get_props commands queued during export
@@ -67,6 +75,54 @@ internal static class Program
     // count rides along on export_done so the parent can say "finished with N
     // asset warnings" instead of unqualified success.
     private static int _exportWarningCount;
+    // Worker count for the active export command. 0 until an export command
+    // parses its "threads" field; drives the bounded-serialize-thread cap.
+    private static int _exportThreads;
+
+    // ─── Memory budget / gate ─────────────────────────────────────────
+    // Per-export memory policy from the parent's "memory_limit_percent" /
+    // "physical_only" fields (0 bytes = unlimited). Enforced layerwise:
+    //   1. a GC heap hard limit (AppContext AppContext.SetData +
+    //      GC.RefreshMemoryLimit) — the GC refuses to grow the managed heap
+    //      past the cap and collects more aggressively as it nears it;
+    //   2. a per-asset gate that backs off as process memory (which includes
+    //      the native Skia/GPU buffers the GC can't see) nears the budget;
+    //   3. batch barriers that run a blocking compacting GC and, in
+    //      physical-only mode, trim the working set back to the OS.
+    private static long _memoryBudgetBytes;   // 0 = unlimited
+    private static bool _physicalOnly;        // keep the working set inside physical RAM
+    private static long _totalPhysicalBytes;  // physical RAM snapshot (physical-only clamp)
+    private static long _availableMemoryBytes; // RAM available right now (percentage basis)
+    private static long _softGateBytes;       // workers back off above 80% of budget
+    private static long _hardGateBytes;       // collect + give-up threshold, 95% of budget
+    private static bool _gcHeapLimitActive;   // AppContext GCHeapHardLimit currently applied
+    private static readonly Process _selfProcess = Process.GetCurrentProcess();
+    private static long _lastGateGcMs;        // rate-limits in-gate global collections
+    private static readonly object _gateGcLock = new();
+    private static int _configuredDop;        // parent-configured worker count
+    private static int _effectiveDop;         // adaptive worker count (memory-budgeted)
+    private static string _lastPolicyNoticeKey = "";
+
+    // Files at/above this size stream to disk instead of buffering in managed
+    // memory. Videos (.bk2/.mp4) are the real driver — a 2 GB cutscene must
+    // never exist whole inside a byte[].
+    private const long LargeRawFileBytes = 64 * 1024 * 1024;
+    // Physical-only mode leaves this much RAM to the OS/GUI: 10% of physical,
+    // floored at 512 MB — paging is the failure mode the checkbox exists to
+    // prevent, and an exporter that trusts the page file defeats it.
+    private const long PhysicalOnlyReservePercent = 10;
+    private const long PhysicalOnlyReserveFloor = 512L * 1024 * 1024;
+    // Long texture decode+encode lanes peak around O(100 MB) per worker
+    // (CTexture pixels + SKBitmap + encode output). Bleeding generous so a
+    // tight budget parks workers instead of tripping the hard gate.
+    private const long PerWorkerPeakBytes = 192 * 1024 * 1024;
+    // Gate give-up: no measurable progress for this long at the hard wall and
+    // the asset is skipped with a clear error rather than wedging its worker.
+    private const int HardGateGiveUpMs = 10_000;
+    // Export commands process assets in modest batches — the budget only ever
+    // has to cover the in-flight LOD/decode peaks, never the whole run, and
+    // each batch barrier reclaims buffers between them.
+    private const int ExportBatchSize = 64;
 
     // Version-mismatch hint: when a stream of warnings/errors look like the UE
     // struct layout doesn't match the data on disk, surface a one-shot hint to
@@ -197,52 +253,120 @@ internal static class Program
     }
 
     /// <summary>
-    /// Run <paramref name="action"/> on a 4 MB-stack background thread to avoid
-    /// StackOverflow on deeply-nested CUE4Parse object graphs. Caps active
-    /// threads at <see cref="MaxConcurrentSerializeThreads"/>; on overflow
-    /// emits a warning and returns null. capturedError is populated if the
-    /// action threw before completing.
+    /// Run <paramref name="action"/> on a pool of dedicated 4 MB-stack background
+    /// threads to avoid StackOverflow on deeply-nested CUE4Parse object graphs.
+    /// The pool is created lazily on first use; worker count grows to
+    /// <see cref="MaxConcurrentSerializeThreads"/> so N parallel export workers
+    /// can each hold one serialization thread without tripping the cap. Each
+    /// request waits up to <paramref name="timeoutMs"/> for a completion;
+    /// on timeout the item is orphaned (the action keeps running to
+    /// completion on its worker — results are discarded), a warning is
+    /// emitted and null is returned. capturedError is populated if the action
+    /// threw before completing.
     /// </summary>
     private static T? RunOnBoundedThread<T>(Func<T> action, int timeoutMs, out Exception? capturedError) where T : class
     {
-        T? result = null;
-        Exception? err = null;
-        Thread thread;
-        lock (_serializeThreadsLock)
+        EnsureSerializeWorkers();
+        var work = new SerializeWork(() => (object?)action());
+        _serializeQueue.Add(work);
+
+        if (!work.Completion.Task.Wait(timeoutMs))
         {
-            _serializeThreads.RemoveWhere(t => !t.IsAlive);
-            if (_serializeThreads.Count >= MaxConcurrentSerializeThreads)
-            {
-                Respond(new { type = "warning", message = "Serialize thread cap reached; skipping" });
-                capturedError = null;
-                return null;
-            }
-            thread = new Thread(() =>
-            {
-                try { result = action(); }
-                catch (Exception ex) { err = ex; }
-                finally
-                {
-                    lock (_serializeThreadsLock)
-                    {
-                        _serializeThreads.Remove(Thread.CurrentThread);
-                    }
-                }
-            }, 4 * 1024 * 1024)
-            {
-                IsBackground = true,
-                Priority = ThreadPriority.BelowNormal
-            };
-            _serializeThreads.Add(thread);
-            thread.Start();
+            // The action keeps running on its orphaned worker; we just stop
+            // waiting for it. The pool (worker count) still bounds concurrent
+            // 4 MB stacks, so saturation degrades to waiting, never to growth.
+            Respond(new { type = "warning", message = $"Serialize worker pool saturated; skipped serialization after {timeoutMs} ms" });
+            capturedError = null;
+            return null;
         }
-        thread.Join(timeoutMs);
-        capturedError = err;
-        return result;
+
+        // Always Use results, never let the TCS exception surface raw.
+        var task = work.Completion.Task;
+        if (task.Status == TaskStatus.RanToCompletion)
+        {
+            capturedError = null;
+            return task.Result as T;
+        }
+        // Faulted — unwrap the original exception.
+        capturedError = task.Exception?.InnerException;
+        return null;
     }
 
     private static string? RunSerializeOnBoundedThread(Func<string> action, int timeoutMs)
         => RunOnBoundedThread(action, timeoutMs, out _);
+
+    // ─── Pooled serialization workers ─────────────────────────────────
+    // Replacing the previous thread-per-request model: a fresh 4 MB-stack
+    // Thread was constructed for EVERY serialized UObject (mesh/material props
+    // on every export). Thread construction + teardown cost dominates on
+    // texture-light/mesh-heavy batches, and the cap logic churned the
+    // _serializeThreads HashSet once per request. A persistent pool amortizes
+    // all of that while preserving the memory bound: at most
+    // MaxConcurrentSerializeThreads live workers, each holding exactly one
+    // 4 MB stack.
+    private sealed class SerializeWork
+    {
+        public SerializeWork(Func<object?> action)
+        {
+            Action = action;
+            Completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        public Func<object?> Action { get; }
+        public TaskCompletionSource<object?> Completion { get; }
+    }
+
+    private static readonly System.Collections.Concurrent.BlockingCollection<SerializeWork> _serializeQueue =
+        new(new System.Collections.Concurrent.ConcurrentQueue<SerializeWork>());
+    private static int _serializeWorkers;
+    private static readonly object _serializePoolLock = new();
+    private const int SerializeStackSizeBytes = 4 * 1024 * 1024;
+
+    /// <summary>Spawn serialized-work up to
+    /// <see cref="MaxConcurrentSerializeThreads"/> persistent 4 MB-stack
+    /// workers. Called lazily on first <see cref="RunOnBoundedThread{T}"/>
+    /// and on every request, so doubling DOP at a new export picks up the
+    /// larger cap without a restart.</summary>
+    private static void EnsureSerializeWorkers()
+    {
+        var want = Math.Min(MaxConcurrentSerializeThreads, 64);
+        if (_serializeWorkers >= want) return;
+        lock (_serializePoolLock)
+        {
+            while (_serializeWorkers < want)
+            {
+                _serializeWorkers++;
+                var worker = new Thread(SerializeWorkerLoop, SerializeStackSizeBytes)
+                {
+                    IsBackground = true,
+                    Priority = ThreadPriority.BelowNormal
+                };
+                worker.Start();
+            }
+        }
+    }
+
+    private static void SerializeWorkerLoop()
+    {
+        // Note: TryTake blocks indefinitely; items added after a saturating
+        // caller stops waiting are still executed (their result is discarded),
+        // preserving the prior orphaned-thread behavior. The CLI dies when the
+        // parent exits, and IsBackground threads don't block shutdown.
+        while (true)
+        {
+            if (!_serializeQueue.TryTake(out var work, Timeout.Infinite))
+                return; // collection completed
+            try
+            {
+                work.Completion.TrySetResult(work.Action());
+            }
+            catch (Exception ex)
+            {
+                // Deliver the original exception rather than wrapping in
+                // AggregateException — callers surface ex.Message directly.
+                try { work.Completion.TrySetException(ex); } catch { /* racing Wait timeout */ }
+            }
+        }
+    }
 
     // ─── Constants ────────────────────────────────────────────────────
 
@@ -284,16 +408,40 @@ internal static class Program
     public static string VgmstreamZipSha256Active =>
         OperatingSystem.IsWindows() ? VgmstreamZipSha256Win : VgmstreamZipSha256Linux;
 
+    // ffmpeg (MP3/WebM audio encoding): BtbN's GPL shared build. Pinned to a
+    // dated autobuild tag — the rolling "latest" release replaces its assets,
+    // which would silently invalidate a pinned SHA256. The "-shared" variant is
+    // used instead of the full static build: same encoders (libmp3lame,
+    // libopus, webm muxer all verified in this artifact), roughly half the
+    // download. Hashes cover the raw archive bytes as published upstream;
+    // extraction streams to disk rather than buffering the ~90 MB archive in
+    // managed memory.
+    private const string FfmpegArchiveSha256Win =
+        "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2";
+    private const string FfmpegArchiveUrlWin =
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07/ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip";
+    private const string FfmpegArchiveSha256Linux =
+        "032d9dbc214ec10fb8d455c96fffcadca6d88c9d818644413c734a19ca2439a9";
+    private const string FfmpegArchiveUrlLinux =
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07/ffmpeg-n8.1.3-14-g330caae0c1-linux64-gpl-shared-8.1.tar.xz";
+
+    public static string FfmpegArchiveUrlActive =>
+        OperatingSystem.IsWindows() ? FfmpegArchiveUrlWin : FfmpegArchiveUrlLinux;
+    public static string FfmpegArchiveSha256Active =>
+        OperatingSystem.IsWindows() ? FfmpegArchiveSha256Win : FfmpegArchiveSha256Linux;
+
     // Hard cap on a single NDJSON command line. Anything bigger is treated as
     // adversarial input (stuck/runaway parent) — drop the line and respond with
     // an error rather than buffering forever.
     private const int MaxStdinLineBytes = 4 * 1024 * 1024;
 
-    // Bound concurrent serialization threads. Each is a fresh 4 MB stack so
-    // unbounded growth = OOM. If we hit the cap, refuse new work and warn.
-    private const int MaxConcurrentSerializeThreads = 8;
-    private static readonly HashSet<Thread> _serializeThreads = new();
-    private static readonly object _serializeThreadsLock = new();
+    // Bound concurrent serialization work. Each worker is a dedicated 4 MB
+    // stack so unbounded growth = OOM. If the pool (and its waiters) exceed
+    // the cap, requests drop with a timeout warning rather than growing.
+    // Scales with the export worker count so N parallel workers can each hold
+    // one serialization thread without tripping the cap (floor of 8 preserves
+    // the original limit for scan/list commands).
+    private static int MaxConcurrentSerializeThreads => Math.Max(8, _exportThreads);
 
     // ─── Entry ────────────────────────────────────────────────────────
     private static async Task Main(string[] args)
@@ -413,10 +561,10 @@ internal static class Program
                 HandleDetectUeVersion(cmd);
                 break;
             case "export":
-                await RunExportWithCancelSupport(reader, () => HandleExport(cmd));
+                await RunExportWithCancelSupport(reader, () => HandleExport(cmd), reclaimAfter: true);
                 break;
             case "export_folder":
-                await RunExportWithCancelSupport(reader, () => HandleExportFolder(cmd));
+                await RunExportWithCancelSupport(reader, () => HandleExportFolder(cmd), reclaimAfter: true);
                 break;
             case "inspect":
                 HandleInspect(cmd);
@@ -450,7 +598,13 @@ internal static class Program
                 break;
             case "cancel":
                 _cts.Cancel();
+                // Swap then dispose: a cancelled CTS keeps its registration
+                // lists alive until finalized otherwise. This path only runs
+                // in the main loop (between cancel-supported operations), so
+                // no task still holds a token from the disposed source.
+                var cancelledCts = _cts;
                 _cts = new CancellationTokenSource();
+                cancelledCts.Dispose();
                 Respond(new { type = "cancelled" });
                 break;
             case "quit":
@@ -514,7 +668,7 @@ internal static class Program
     /// stdin for cancel/quit commands.  Browse commands are processed inline.
     /// Only ONE reader touches the StreamReader at a time (no concurrent reads).
     /// </summary>
-    private static async Task RunExportWithCancelSupport(StreamReader reader, Action exportAction)
+    private static async Task RunExportWithCancelSupport(StreamReader reader, Action exportAction, bool reclaimAfter = false)
     {
         _exportTask = Task.Run(exportAction);
 
@@ -548,7 +702,26 @@ internal static class Program
                 {
                     case "cancel":
                         _cts.Cancel();
+                        // A cancel must stop the whole pending run, not just
+                        // the current leg. The parent pipelines one export
+                        // command per selected folder, and those queue here
+                        // while an export runs; RunMainLoop drains them the
+                        // moment this operation completes. Left in the queue
+                        // they would start full-speed exports with a freshly
+                        // reset token — exactly as if the cancel never
+                        // happened, which reads as "cancel takes forever"
+                        // while the Cancel button is already back to
+                        // disabled. Discard them; pending get_props (leaf
+                        // reads) stay queued as they are quick and harmless.
+                        var droppedCommands = _pendingCommands.Count;
+                        _pendingCommands.Clear();
                         Respond(new { type = "cancelled" });
+                        if (droppedCommands > 0)
+                            Respond(new
+                            {
+                                type = "warning",
+                                message = $"Cancel also discarded {droppedCommands} queued export command(s) that were still waiting to run",
+                            });
                         break;
                     case "quit":
                         _cts.Cancel();
@@ -614,6 +787,9 @@ internal static class Program
             _cts.Dispose();
             _cts = new CancellationTokenSource();
         }
+
+        if (reclaimAfter)
+            ReclaimExportMemory();
     }
 
     // ─── Init ─────────────────────────────────────────────────────────
@@ -807,6 +983,8 @@ internal static class Program
             throw;
         }
 
+        EnsureConcurrentReaders();
+
         var archiveCount = _provider.MountedVfs.Count;
         var fileCount = _provider.Files.Count;
         // Count archives still requiring keys
@@ -883,6 +1061,23 @@ internal static class Program
         // mid-export. Warn once at mount time so it's diagnosable up front.
         ProbeSkia();
 
+        // GPU texture decode: probe once per mount and report availability so
+        // the GUI can show what the upcoming exports will use. The resolved
+        // "gpu" value (GUI passes Auto explicitly resolved to bool in the
+        // config, or omits it) is honored by exports; the probe itself only
+        // asks Vulkan what devices exist.
+        EmitGpuStatus(cmd);
+
+        // Echo the GC the process actually launched with — the "use only
+        // physical memory" setting relaunches the CLI with workstation GC
+        // (env beats runtimeconfig on net9+), and this log line is how the
+        // user verifies it took effect.
+        Respond(new
+        {
+            type = "info",
+            message = $"Garbage collector: {(GCSettings.IsServerGC ? "server" : "workstation")}",
+        });
+
         Respond(new
         {
             type = "init_done",
@@ -896,6 +1091,33 @@ internal static class Program
     }
 
     private static bool _skiaProbed;
+
+    /// <summary>
+    /// GPU texture decode preference for the active/export commands. Set from
+    /// the "gpu" field (init/export/export_folder); defaults to true so a
+    /// bare CLI run gets GPU acceleration when a suitable device exists, and
+    /// export falls back to the CPU decoder per texture whenever the GPU path
+    /// cannot handle a texture.
+    /// </summary>
+    private static bool _gpuDecode = true;
+
+    /// <summary>
+    /// Probe the GPU decoder and emit a single gpu_status NDJSON record on
+    /// stdout. Called at init so the GUI can report device availability;
+    /// cheap after the first call (probe result is cached).
+    /// </summary>
+    private static void EmitGpuStatus(JObject? cmd)
+    {
+        if (cmd is not null && cmd["gpu"] is { } flag)
+            _gpuDecode = !(flag.Type == JTokenType.Boolean && !flag.Value<bool>());
+        if (!_gpuDecode)
+        {
+            Respond(new { type = "gpu_status", available = false, device = "", reason = "disabled by export settings" });
+            return;
+        }
+        var (available, device, reason) = GpuTextureDecoder.Probe();
+        Respond(new { type = "gpu_status", available, device, reason });
+    }
 
     /// <summary>
     /// Cheap warm-up: touches SkiaSharp's static state so the DllImport /
@@ -1202,8 +1424,533 @@ internal static class Program
     }
 
     // ─── Export single assets ─────────────────────────────────────────
+    /// <summary>
+    /// Parse the "threads" field of an export command. &gt;0 trusts the parent;
+    /// anything else means auto — one worker per core (uncapped).
+    /// </summary>
+    private static int ResolveExportThreads(JObject cmd)
+    {
+        var requested = cmd["threads"]?.Value<int>() ?? 0;
+        return requested > 0 ? requested : Environment.ProcessorCount;
+    }
+
+    // ─── Memory policy ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Cross-platform, human-scaled byte formatter for memory notices.
+    /// </summary>
+    private static string FormatByteAmount(long bytes)
+    {
+        if (bytes >= 1024L * 1024 * 1024)
+            return $"{bytes / (double)(1024L * 1024 * 1024):F1} GB";
+        if (bytes >= 1024 * 1024)
+            return $"{bytes / (double)(1024 * 1024):F0} MB";
+        return $"{bytes} B";
+    }
+
+    /// <summary>
+    /// Parse "memory_limit_percent" (0 = unlimited, otherwise clamped 1-95)
+    /// and "physical_only", then compute the export budget. The percentage
+    /// applies to the RAM that is currently available (free) — not the total
+    /// — so the exporter stays a well-behaved citizen when the machine is
+    /// under memory pressure. The exporter's own resident pages (mounted
+    /// archive index, leftovers from previous commands) are added back to the
+    /// free-RAM probe, since it can shrink those; without the add-back each
+    /// export in a long-lived CLI session would budget against its own
+    /// footprint and starve its successor. physical_only still clamps the
+    /// budget to total physical RAM minus an OS reserve even when no
+    /// percentage is set, so the exporter can never push its working set into
+    /// swap. Also establishes the GC heap hard limit (~85% of the budget —
+    /// the rest is headroom for native Skia/Vulkan buffers the GC can't see)
+    /// and seeds the adaptive worker count.
+    /// </summary>
+    /// <param name="adaptDop">false for the audio/video handlers, whose local
+    /// degree of parallelism is theirs to manage.</param>
+    private static void ResolveMemoryPolicy(JObject cmd, bool adaptDop = true)
+    {
+        var pct = cmd.Value<int?>("memory_limit_percent") ?? 0;
+        if (pct is < 0 or > 95) pct = 0;
+        _physicalOnly = cmd["physical_only"]?.Value<bool>() ?? false;
+
+        // TotalAvailableMemoryBytes honors container limits; catching here is
+        // just belt-and-braces against exotic runtimes.
+        try { _totalPhysicalBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes; }
+        catch { _totalPhysicalBytes = 0; }
+        _availableMemoryBytes = ProbeAvailableMemoryBytes();
+
+        // Our own resident pages are counted as "used" by the OS probe, but
+        // they are ours to release — add them back so the budget reflects
+        // what is free beyond the footprint we already hold. selfWS is part
+        // of the "used" total the free probe excludes, so effectiveFree can
+        // never exceed total physical RAM and the budget never exceeds
+        // pct% of real RAM.
+        long effectiveFree = _availableMemoryBytes > 0
+            ? _availableMemoryBytes + Math.Max(0L, CurrentWorkingSetBytes())
+            : 0;
+
+        long budget = 0;
+        if (pct > 0 && effectiveFree > 0)
+            budget = (long)((ulong)effectiveFree * (ulong)Math.Min(pct, 95) / 100UL);
+
+        if (_physicalOnly && _totalPhysicalBytes > 0)
+        {
+            var reserve = Math.Max(PhysicalOnlyReserveFloor, _totalPhysicalBytes / PhysicalOnlyReservePercent);
+            var physBudget = _totalPhysicalBytes - reserve;
+            if (physBudget > 0 && (budget == 0 || physBudget < budget))
+                budget = physBudget;
+        }
+
+        _memoryBudgetBytes = budget;
+        _softGateBytes = budget > 0 ? (long)((double)budget * 0.80) : 0;
+        _hardGateBytes = budget > 0 ? (long)((double)budget * 0.95) : 0;
+
+        ApplyGcHeapLimit();
+
+        if (adaptDop)
+        {
+            _configuredDop = Math.Max(1, _exportThreads);
+            _effectiveDop = ComputeInitialDop();
+        }
+
+        var noticeKey = $"{budget}/{_physicalOnly}";
+        if (noticeKey != _lastPolicyNoticeKey)
+        {
+            _lastPolicyNoticeKey = noticeKey;
+            if (budget > 0)
+            {
+                string basis;
+                if (pct > 0)
+                {
+                    basis = $"{pct}% of {FormatByteAmount(effectiveFree)} RAM currently free";
+                }
+                else
+                {
+                    // 100 - reserve = 90% of total RAM in physical-only mode
+                    // with no explicit percentage.
+                    var total = _totalPhysicalBytes > 0
+                        ? $" (90% of {FormatByteAmount(_totalPhysicalBytes)} physical RAM)"
+                        : "";
+                    basis = $"physical-only cap{total}";
+                }
+                var mode = _physicalOnly ? ", physical-only mode" : "";
+                Respond(new
+                {
+                    type = "info",
+                    message = $"Memory limit active: {FormatByteAmount(budget)} ({basis}{mode})",
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Establish (or clear) the runtime-adjustable GC heap hard limit. When a
+    /// limited export later emits an unlimited command, dropping the
+    /// AppContext value and re-refreshing restores the runtime default — the
+    /// AppContext reader treats a missing value as "no override"
+    /// (``as ulong? ?? ulong.MaxValue`` in GC.CoreCLR), and a literal 0 would
+    /// instead be an invalid limit.
+    /// </summary>
+    private static void ApplyGcHeapLimit()
+    {
+        try
+        {
+            if (_memoryBudgetBytes > 0)
+            {
+                AppContext.SetData("GCHeapHardLimit", (ulong)(_memoryBudgetBytes * 85 / 100));
+                GC.RefreshMemoryLimit();
+                _gcHeapLimitActive = true;
+            }
+            else if (_gcHeapLimitActive)
+            {
+                AppContext.SetData("GCHeapHardLimit", null);
+                GC.RefreshMemoryLimit();
+                _gcHeapLimitActive = false;
+            }
+        }
+        catch (InvalidOperationException ex)
+        {
+            // The new limit is below what is already committed (a freshly
+            // mounted archive index can be large) or 32-bit refused the call.
+            // The export must go on — the per-asset gate still bounds usage.
+            _gcHeapLimitActive = false;
+            Respond(new
+            {
+                type = "warning",
+                message = $"Memory limit not applied to the GC heap: {SanitizeMessage(ex.Message)}",
+            });
+        }
+    }
+
+    /// <summary>Worker count for a budgeted export: never more than the parent
+    /// configured, and never more than the budget can hold one peak per
+    /// worker. Always at least one worker — progress never stalls entirely.</summary>
+    private static int ComputeInitialDop()
+    {
+        var configured = Math.Max(1, _configuredDop);
+        if (_memoryBudgetBytes <= 0) return configured;
+        var affordable = (int)Math.Max(1, _memoryBudgetBytes / PerWorkerPeakBytes);
+        return Math.Min(configured, affordable);
+    }
+
+    /// <summary>The degree of parallelism the batched runner actually uses.</summary>
+    private static int EffectiveDop() =>
+        _memoryBudgetBytes > 0 ? Math.Max(1, _effectiveDop) : Math.Max(1, _exportThreads);
+
+    /// <summary>
+    /// Process memory the budget is measured against. Working set (RSS on
+    /// Linux, WS on Windows) is the right yardstick for physical-only mode
+    /// because it counts the native Skia/Vulkan pages the GC is blind to.
+    /// Falls back to the GC's own load estimate if private queries fail.
+    /// </summary>
+    private static long CurrentWorkingSetBytes()
+    {
+        try
+        {
+            _selfProcess.Refresh();
+            var ws = _selfProcess.WorkingSet64;
+            if (ws > 0) return ws;
+        }
+        catch { /* probing failed — fall through to the GC estimate */ }
+        try { return GC.GetGCMemoryInfo().MemoryLoadBytes; }
+        catch { return 0; }
+    }
+
+    /// <summary>
+    /// RAM the OS can hand out right now without swapping — the basis the
+    /// "memory_limit_percent" is applied to. Probed per-OS first (Windows
+    /// GlobalMemoryStatusEx, Linux /proc/meminfo MemAvailable); if a native
+    /// probe fails, falls back to the GC's container-aware estimate
+    /// (TotalAvailableMemoryBytes − MemoryLoadBytes keeps cgroup semantics,
+    /// so it is correct inside containers too). 0 = unknown.
+    /// Called once per export command when the policy resolves — a snapshot,
+    /// not a poller; nothing here retains state across calls.
+    /// </summary>
+    private static long ProbeAvailableMemoryBytes()
+    {
+        var native = 0L;
+        try
+        {
+            if (OperatingSystem.IsWindows())
+                native = WindowsAvailableMemoryBytes();
+            else if (OperatingSystem.IsLinux())
+                native = LinuxAvailableMemoryBytes();
+        }
+        catch { native = 0; }   // exotic runtime / stripped kernel interface
+
+        if (native > 0) return native;
+        try
+        {
+            var info = GC.GetGCMemoryInfo();
+            var free = info.TotalAvailableMemoryBytes - info.MemoryLoadBytes;
+            return free > 0 ? free : 0;
+        }
+        catch { return 0; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORYSTATUSEX
+    {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    // ullAvailPhys is the kernel's "memory you can allocate without severely
+    // impacting other applications" — includes the standby list, so it is the
+    // same notion of "available" as Linux MemAvailable.
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+    private static long WindowsAvailableMemoryBytes()
+    {
+        var stat = new MEMORYSTATUSEX
+        {
+            dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>(),
+        };
+        // The ull* fields are 64-bit for a 32-bit caller too; a real reading
+        // can never exceed long.MaxValue (8 EB), so the cast is safe.
+        return GlobalMemoryStatusEx(ref stat) && stat.ullAvailPhys <= long.MaxValue
+            ? (long)stat.ullAvailPhys
+            : 0;
+    }
+
+    private static long LinuxAvailableMemoryBytes()
+    {
+        // MemAvailable is the kernel's own estimate of allocatable-without-
+        // swapping RAM (free pages + reclaimable cache); MemFree is the
+        // fallback on kernels that predate the field (< 3.14).
+        if (!File.Exists("/proc/meminfo")) return 0;
+        var fallback = 0L;
+        foreach (var line in File.ReadLines("/proc/meminfo"))
+        {
+            if (line.StartsWith("MemAvailable:", StringComparison.Ordinal))
+                return ParseMeminfoKib(line);
+            if (fallback == 0 && line.StartsWith("MemFree:", StringComparison.Ordinal))
+                fallback = ParseMeminfoKib(line);
+        }
+        return fallback;
+    }
+
+    /// <summary>Parse the "value kB" tail of a /proc/meminfo line into bytes.</summary>
+    private static long ParseMeminfoKib(string line)
+    {
+        var colon = line.IndexOf(':');
+        if (colon < 0) return 0;
+        var tail = line.Substring(colon + 1).Trim();
+        var space = tail.IndexOf(' ');
+        if (space <= 0) return 0;
+        return long.TryParse(tail.AsSpan(0, space), out var kib) ? kib * 1024L : 0;
+    }
+
+    /// <summary>
+    /// Per-asset memory gate. Healthy (< 80% of budget) → runs immediately.
+    /// Approaching → the worker backs off in small sleeps so in-flight decodes
+    /// can drain. At the hard wall → one rate-limited worker performs a
+    /// blocking compacting collection while the others simply wait. Sustained
+    /// overload is shed as a per-asset failure after a bounded wait, never an
+    /// unbounded hang. Cancellation-aware: cancel always wins immediately.
+    /// </summary>
+    private static void WaitUnderMemoryGate(CancellationToken token)
+    {
+        if (_memoryBudgetBytes <= 0) return;
+
+        var backoffMs = 50;
+        var startMs = Environment.TickCount64;
+
+        while (!token.IsCancellationRequested)
+        {
+            var used = CurrentWorkingSetBytes();
+
+            if (used < _softGateBytes)
+                return;
+
+            if (used < _hardGateBytes)
+            {
+                // Approaching — let whatever is in flight finish and drain.
+                Thread.Sleep(backoffMs);
+                backoffMs = Math.Min(250, backoffMs * 2);
+                continue;
+            }
+
+            // At the hard wall — one worker (rate-limited to one collection
+            // every 300 ms) runs the blocking compacting GC; others wait so
+            // we don't stack point GCs. GC suspension collects the sleeping
+            // workers at their safe points as usual.
+            if (Monitor.TryEnter(_gateGcLock))
+            {
+                try
+                {
+                    var now = Environment.TickCount64;
+                    if (now - _lastGateGcMs >= 300)
+                    {
+                        _lastGateGcMs = now;
+                        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                    }
+                }
+                finally
+                {
+                    Monitor.Exit(_gateGcLock);
+                }
+            }
+
+            Thread.Sleep(backoffMs);
+            backoffMs = Math.Min(250, backoffMs * 2);
+
+            if (Environment.TickCount64 - startMs > HardGateGiveUpMs)
+                throw new MemoryLimitExceededException(
+                    $"Could not free memory below the limit ({FormatByteAmount(_memoryBudgetBytes)}) within {HardGateGiveUpMs / 1000} s — asset skipped");
+        }
+    }
+
+    /// <summary>
+    /// Batch barrier: a blocking compacting GC returns LOS UObject graphs,
+    /// decoded pixel buffers and mesh LOD arrays to the OS, then — in
+    /// physical-only mode — the working set is trimmed so the OS stops
+    /// attributing parked-but-free pages to the exporter (no page-file
+    /// reliance). Afterwards the adaptive worker count is re-evaluated from
+    /// live usage: shed when pressed, restored when comfortable.
+    /// </summary>
+    private static void CollectAndTrimBetweenBatches()
+    {
+        if (_memoryBudgetBytes <= 0) return;
+
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+
+        if (_physicalOnly) TrimWorkingSet();
+
+        _effectiveDop = CurrentWorkingSetBytes() >= _hardGateBytes
+            ? Math.Max(1, _effectiveDop / 2)
+            : (_effectiveDop < _configuredDop && CurrentWorkingSetBytes() < _softGateBytes
+                ? Math.Min(_configuredDop, _effectiveDop + 1)
+                : _effectiveDop);
+    }
+
+    /// <summary>
+    /// Post-export reclaim, run after every completed asset export (success,
+    /// failure, or cancel). A blocking compacting collection with a one-shot
+    /// LOH compaction returns decoded pixel buffers, mesh LOD arrays and WEM
+    /// payloads parked in managed memory to the OS promptly — without it an
+    /// idle server-GC CLI can hold region-sized free heaps indefinitely after
+    /// a cancel discards in-flight decode work. The unconditional working-set
+    /// trim (below) evicts the freed pages even when no memory budget is
+    /// active, so the OS sees the release instead of "free list" pages.
+    /// Runs after ``await _exportTask`` — the handler's succeeded/failed lists
+    /// and every in-flight decode object are already unreferenced, so nothing
+    /// survives the collection and no live state is touched. Hygiene must
+    /// never surface as an error, hence the blanket catch.
+    /// </summary>
+    private static void ReclaimExportMemory()
+    {
+        try
+        {
+            GCSettings.LargeObjectHeapCompactionMode =
+                GCLargeObjectHeapCompactionMode.CompactOnce;  // one-shot; auto-resets to Default
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+
+            TrimWorkingSet();
+        }
+        catch (Exception) { /* never fail an export over hygiene */ }
+    }
+
+    /// <summary>Platform best-effort working-set trim. Windows asks psapi to
+    /// evict the process's own resident set; Linux (glibc) releases free
+    /// allocator arenas back to the OS via malloc_trim. Load-time guarded,
+    /// failure-tolerant — hygiene must never fail an export.</summary>
+    private static void TrimWorkingSet()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                EmptyWorkingSet(_selfProcess.Handle);
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                _ = malloc_trim(nint.Zero);
+            }
+        }
+        catch (DllNotFoundException) { }   // exotic libc / stripped image
+        catch (EntryPointNotFoundException) { }   // musl et al.
+        catch (Exception) { }   // never fail an export over hygiene
+    }
+
+    [DllImport("psapi.dll", SetLastError = true)]
+    private static extern bool EmptyWorkingSet(nint hProcess);
+
+    // libc malloc_trim — glibc only; other libcs land in the guarded catches.
+    [DllImport("libc")]
+    private static extern int malloc_trim(nint pad);
+
+    private sealed class MemoryLimitExceededException(string message) : Exception(message);
+
+    /// <summary>
+    /// Shared bulk-export driver for HandleExport / HandleExportFolder: asset
+    /// paths are processed in modest batches (see ExportBatchSize), gated per
+    /// asset, and closed with a collect-and-trim barrier. Returns the counts
+    /// and lists the handlers turn into their own export_done payloads.
+    /// </summary>
+    /// <param name="failOnUnsupported">true for the named-paths export, where
+    /// "loaded but nothing exportable" reads as a per-path failure; false for
+    /// folder exports, which stay silent about such paths.</param>
+    /// <param name="includeExceptionType">Each handler's historical failure
+    /// message shape: the named export reports the sanitized message, the
+    /// folder export prefixes the exception type name.</param>
+    private static (int Done, List<string> Succeeded, List<object> Failed) RunBatchedExport(
+        List<string> assetPaths, string outputDir, Dictionary<string, bool> formats,
+        ConcurrentSet visited, bool failOnUnsupported, bool includeExceptionType)
+    {
+        var succeeded = new ConcurrentQueue<string>();
+        var failed = new ConcurrentQueue<object>();
+        var pacer = new ProgressPacer();
+        int done = 0;
+
+        for (var offset = 0; offset < assetPaths.Count; offset += ExportBatchSize)
+        {
+            if (_cts.Token.IsCancellationRequested) break;
+
+            var batch = assetPaths.GetRange(offset,
+                Math.Min(ExportBatchSize, assetPaths.Count - offset));
+
+            try
+            {
+                // Wiring the token into ParallelOptions makes the scheduler stop
+                // taking new iterations the moment cancel lands — previously the
+                // whole 64-asset batch was drained one early-return at a time.
+                // Iterations already in flight still finish (CUE4Parse's
+                // LoadPackage is not interruptible); unstarted work is discarded.
+                Parallel.ForEach(batch, new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = EffectiveDop(),
+                    CancellationToken = _cts.Token,
+                },
+                assetPath =>
+                {
+                    if (_cts.Token.IsCancellationRequested) return;
+                    var d = Interlocked.Increment(ref done);
+                    pacer.Emit(d, assetPaths.Count, ProgressMessage(assetPath));
+
+                    try
+                    {
+                        WaitUnderMemoryGate(_cts.Token);
+                        var exported = ExportAsset(assetPath, outputDir, formats, visited);
+                        if (exported)
+                            succeeded.Enqueue(assetPath);
+                        else if (failOnUnsupported)
+                            failed.Enqueue(new { path = assetPath, error = "Unsupported asset type or no exportable data" });
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Enqueue(new
+                        {
+                            path = assetPath,
+                            error = includeExceptionType
+                                ? $"{ex.GetType().Name}: {SanitizeMessage(ex.Message)}"
+                                : SanitizeMessage(ex.Message),
+                        });
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancel landed mid-batch — partial results stand and no further
+                // batches are scheduled; the post-export reclaim frees buffers.
+            }
+
+            if (_cts.Token.IsCancellationRequested) break;
+
+            CollectAndTrimBetweenBatches();
+        }
+
+        return (done, succeeded.ToList(), failed.ToList());
+    }
+
+    /// <summary>Progress label for an in-flight asset; carries live usage when
+    /// a budget is active so the GUI progress bar doubles as a memory gauge.</summary>
+    private static string ProgressMessage(string assetPath)
+    {
+        var name = Path.GetFileName(assetPath);
+        return _memoryBudgetBytes <= 0
+            ? $"Exporting: {name}"
+            : $"Exporting: {name} ({FormatByteAmount(CurrentWorkingSetBytes())} / {FormatByteAmount(_memoryBudgetBytes)})";
+    }
+
     private static Task HandleExport(JObject cmd)
     {
+        // Format/policy fields all parse before the provider check so the
+        // parent sees its settings echoed (memory notice) even when the
+        // command then fails the "not initialized" check.
+        _exportThreads = ResolveExportThreads(cmd);
+        ResolveMemoryPolicy(cmd);
         EnsureProvider();
         var paths = cmd["paths"]?.ToObject<List<string>>() ?? throw new ArgumentException("paths required");
         var outputDir = cmd.Value<string>("output_dir") ?? throw new ArgumentException("output_dir required");
@@ -1216,35 +1963,25 @@ internal static class Program
             ["audio"] = true
         };
         _textureFormat = cmd.Value<string>("texture_format") ?? "png";
-        _audioFormat = cmd.Value<string>("audio_format") ?? "wav";
+        _audioFormat = NormalizeAudioFormat(cmd.Value<string>("audio_format") ?? "wav");
+        _meshFormat = (cmd.Value<string>("mesh_format") ?? "psk").ToLowerInvariant() == "gltf" ? "gltf" : "psk";
+        _webpLossless = !string.Equals(cmd.Value<string>("webp_mode"), "lossy", StringComparison.OrdinalIgnoreCase);
+        var webpQ1 = cmd.Value<int?>("webp_quality");
+        if (webpQ1 is >= 1 and <= 100) _webpQuality = webpQ1.Value;
+        if (cmd["gpu"] is { } gpuFlag)
+            _gpuDecode = gpuFlag.Type == JTokenType.Boolean && !gpuFlag.Value<bool>() ? false : true;
 
         Directory.CreateDirectory(outputDir);
 
-        int total = paths.Count, current = 0;
-        var succeeded = new List<string>();
-        var failed = new List<object>();
-        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var visited = new ConcurrentSet();
         _exportWarningCount = 0;
+        int total = paths.Count;
 
-        foreach (var assetPath in paths)
-        {
-            if (_cts.Token.IsCancellationRequested) break;
-            current++;
-            Respond(new { type = "progress", current, total, message = $"Exporting: {Path.GetFileName(assetPath)}" });
+        Respond(new { type = "progress", current = 0, total, message = $"Found {total} assets to export" });
 
-            try
-            {
-                var exported = ExportAsset(assetPath, outputDir, formats, visited);
-                if (exported)
-                    succeeded.Add(assetPath);
-                else
-                    failed.Add(new { path = assetPath, error = "Unsupported asset type or no exportable data" });
-            }
-            catch (Exception ex)
-            {
-                failed.Add(new { path = assetPath, error = SanitizeMessage(ex.Message) });
-            }
-        }
+        var (done, succeeded, failed) = RunBatchedExport(
+            paths, outputDir, formats, visited,
+            failOnUnsupported: true, includeExceptionType: false);
 
         var cancelled = _cts.Token.IsCancellationRequested;
         Respond(new
@@ -1254,7 +1991,7 @@ internal static class Program
             failed,
             total = paths.Count,
             cancelled,
-            remaining = cancelled ? total - current : 0,
+            remaining = cancelled ? total - done : 0,
             warning_count = _exportWarningCount,
         });
         return Task.CompletedTask;
@@ -1263,6 +2000,9 @@ internal static class Program
     // ─── Export folder (bulk) ─────────────────────────────────────────
     private static Task HandleExportFolder(JObject cmd)
     {
+        // Format/policy fields parse before the provider check — see HandleExport.
+        _exportThreads = ResolveExportThreads(cmd);
+        ResolveMemoryPolicy(cmd);
         EnsureProvider();
         var vfsPath = (cmd.Value<string>("path") ?? "").TrimStart('/');
         var outputDir = cmd.Value<string>("output_dir") ?? throw new ArgumentException("output_dir required");
@@ -1275,7 +2015,13 @@ internal static class Program
             ["audio"] = true
         };
         _textureFormat = cmd.Value<string>("texture_format") ?? "png";
-        _audioFormat = cmd.Value<string>("audio_format") ?? "wav";
+        _audioFormat = NormalizeAudioFormat(cmd.Value<string>("audio_format") ?? "wav");
+        _meshFormat = (cmd.Value<string>("mesh_format") ?? "psk").ToLowerInvariant() == "gltf" ? "gltf" : "psk";
+        _webpLossless = !string.Equals(cmd.Value<string>("webp_mode"), "lossy", StringComparison.OrdinalIgnoreCase);
+        var webpQ2 = cmd.Value<int?>("webp_quality");
+        if (webpQ2 is >= 1 and <= 100) _webpQuality = webpQ2.Value;
+        if (cmd["gpu"] is { } gpuFlag)
+            _gpuDecode = gpuFlag.Type == JTokenType.Boolean && !gpuFlag.Value<bool>() ? false : true;
 
         Directory.CreateDirectory(outputDir);
 
@@ -1297,33 +2043,19 @@ internal static class Program
                 assetPaths.Add(loosePath);
         }
 
-        int total = assetPaths.Count, current = 0;
-        var succeeded = new List<string>();
-        var failed = new List<object>();
-        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // A provider path and a loose file can name the same package; two export
+        // workers racing on one path would write the same output simultaneously,
+        // so dedupe now (the visited set only guards dependency re-exports).
+        assetPaths = assetPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var visited = new ConcurrentSet();
         _exportWarningCount = 0;
+        int total = assetPaths.Count;
 
         Respond(new { type = "progress", current = 0, total, message = $"Found {total} assets to export" });
 
-        foreach (var assetPath in assetPaths)
-        {
-            if (_cts.Token.IsCancellationRequested) break;
-            current++;
-
-            if (current % 10 == 0 || current == total)
-                Respond(new { type = "progress", current, total, message = $"Exporting: {Path.GetFileName(assetPath)}" });
-
-            try
-            {
-                var exported = ExportAsset(assetPath, outputDir, formats, visited);
-                if (exported)
-                    succeeded.Add(assetPath);
-            }
-            catch (Exception ex)
-            {
-                failed.Add(new { path = assetPath, error = $"{ex.GetType().Name}: {SanitizeMessage(ex.Message)}" });
-            }
-        }
+        var (done, succeeded, failed) = RunBatchedExport(
+            assetPaths, outputDir, formats, visited,
+            failOnUnsupported: false, includeExceptionType: true);
 
         var cancelled = _cts.Token.IsCancellationRequested;
         Respond(new
@@ -1333,13 +2065,25 @@ internal static class Program
             failed,
             total = assetPaths.Count,
             cancelled,
-            remaining = cancelled ? total - current : 0,
+            remaining = cancelled ? total - done : 0,
             warning_count = _exportWarningCount,
         });
         return Task.CompletedTask;
     }
 
     // ─── Core export logic ────────────────────────────────────────────
+
+    /// <summary>
+    /// One-add-only set with package paths already exported by the current
+    /// command. Replaces the HashSet the sequential exporters used so many
+    /// parallel workers can dedupe against each other without a global lock.
+    /// </summary>
+    private sealed class ConcurrentSet
+    {
+        private readonly ConcurrentDictionary<string, bool> _dict =
+            new(StringComparer.OrdinalIgnoreCase);
+        public bool Add(string item) => _dict.TryAdd(item, false);
+    }
 
     // Meshes reference materials in other packages, materials reference parent
     // materials and textures. Exporting one mesh must pull that whole chain or
@@ -1351,7 +2095,7 @@ internal static class Program
     private static readonly Regex _depRefRe = new(@"^(?:Material\w*|Texture2D)'", RegexOptions.Compiled);
 
     private static bool ExportAsset(string gamePath, string outputDir, Dictionary<string, bool> formats,
-                                    HashSet<string>? visited = null, int depth = 0)
+                                    ConcurrentSet? visited = null, int depth = 0)
     {
         // Build nested output directory preserving the game path structure.
         // gamePath is parent-supplied — SafeJoin rejects "../" traversal.
@@ -1383,7 +2127,7 @@ internal static class Program
         // One export per package per command — dependency-following would
         // otherwise re-export shared materials/textures for every mesh that
         // references them.
-        visited ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        visited ??= new ConcurrentSet();
         if (!visited.Add(objectPath))
             return true;
 
@@ -1458,7 +2202,7 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                _exportWarningCount++;
+                Interlocked.Increment(ref _exportWarningCount);
                 Respond(new { type = "warning", message = $"{obj.Name} ({obj.ExportType}): {DescribeException(ex)}" });
             }
 
@@ -1502,20 +2246,34 @@ internal static class Program
     // ─── Raw binary export (for .wem, .bnk, etc.) ────────────────────
     private static bool ExportRawFile(string gamePath, string nestedOutputDir)
     {
+        // Resolve the payload source: provider entry first, loose file fallback.
+        _provider!.TryGetGameFile(gamePath, out var providerFile);
+        _looseFiles.TryGetValue(gamePath, out var looseDiskPath);
+        var looseExists = looseDiskPath != null && File.Exists(looseDiskPath!);
+        if (providerFile == null && !looseExists) return false;
+
+        // Large payloads — whole videos, bulk .wem — stream straight to disk.
+        // Holding a 2 GB cutscene in one byte[] is exactly what the memory
+        // cap exists to prevent; small files keep the simple array path.
+        var sourceBytes = providerFile?.Size
+                          ?? (looseExists ? new FileInfo(looseDiskPath!).Length : 0);
+        if (sourceBytes >= LargeRawFileBytes)
+            return ExportLargeRawFileStreaming(providerFile, looseExists ? looseDiskPath : null,
+                                               gamePath, nestedOutputDir);
+
         byte[]? data = null;
 
-        // Try CUE4Parse provider first
-        if (_provider!.TrySaveAsset(gamePath, out var providerData))
+        if (providerFile != null)
         {
-            data = providerData;
+            // Same semantics as TrySaveAsset(GameFile) — SafeRead is null on
+            // unreadable entries, which falls through to the loose check.
+            data = providerFile.SafeRead();
+            if (data == null && !looseExists) return false;
         }
-        // Fall back to loose file on disk
-        else if (_looseFiles.TryGetValue(gamePath, out var diskPath) && File.Exists(diskPath))
+        if (data == null)
         {
-            data = File.ReadAllBytes(diskPath);
+            data = File.ReadAllBytes(looseDiskPath!);
         }
-
-        if (data == null) return false;
 
         var name = Path.GetFileName(gamePath);
         var lowerName = name.ToLowerInvariant();
@@ -1565,6 +2323,118 @@ internal static class Program
         return true;
     }
 
+    /// <summary>
+    /// Stream a large raw payload straight to disk — O(1 MB) copy buffers,
+    /// never the whole file resident in managed memory. Mirrors the byte-array
+    /// path's .wem/.ewem post-processing exactly.
+    /// </summary>
+    private static bool ExportLargeRawFileStreaming(GameFile? providerFile, string? loosePath,
+                                                    string gamePath, string nestedOutputDir)
+    {
+        bool WriteTo(string outPath)
+        {
+            if (providerFile != null)
+                return StreamGameFileTo(providerFile, outPath);
+            if (loosePath == null) return false;
+
+            try
+            {
+                using var src = File.OpenRead(loosePath);
+                using var fs = File.Create(outPath);
+                src.CopyTo(fs, 1 << 20);
+                return true;
+            }
+            catch
+            {
+                // A half-written stream is worse than no file — remove the
+                // partial so a later retry starts fresh.
+                try { File.Delete(outPath); } catch { }
+                return false;
+            }
+        }
+
+        var name = Path.GetFileName(gamePath);
+        var lowerName = name.ToLowerInvariant();
+
+        if (lowerName.EndsWith(".wem"))
+        {
+            EnsureWemNameMap();
+
+            var wemId = Path.GetFileNameWithoutExtension(name);
+            var baseName = _wemIdToName.TryGetValue(wemId, out var debugName)
+                ? $"{debugName}_{wemId}"
+                : wemId;
+
+            var wemPath = SafeJoin(nestedOutputDir, $"{baseName}.wem");
+            if (!WriteTo(wemPath)) return false;
+            var converted = ConvertWithVgmstream(wemPath, nestedOutputDir, _audioFormat);
+            if (converted)
+            {
+                try { File.Delete(wemPath); } catch { }
+            }
+            // Keep the .wem as fallback if conversion failed
+            return true;
+        }
+
+        if (lowerName.EndsWith(".ewem"))
+        {
+            var ewemBase = Path.GetFileNameWithoutExtension(name);
+            var wemPath = SafeJoin(nestedOutputDir, $"{ewemBase}.wem");
+            if (!WriteTo(wemPath)) return false;
+            var converted = ConvertWithVgmstream(wemPath, nestedOutputDir, _audioFormat);
+            if (converted)
+            {
+                try { File.Delete(wemPath); } catch { }
+                return true;
+            }
+            // Conversion failed — likely encrypted. Keep as .wem for manual handling.
+            Respond(new { type = "warning", message = $"{name}: possibly encrypted audio, conversion failed" });
+            return true;
+        }
+
+        var outPath = SafeJoin(nestedOutputDir, name);
+        return WriteTo(outPath);
+    }
+
+    /// <summary>Stream one provider GameFile to *outPath* through its FArchive
+    /// reader (a Stream subclass). False (file untouched) when the payload
+    /// can't be opened — callers fall back to the buffered path.</summary>
+    private static bool StreamGameFileTo(GameFile file, string outPath)
+    {
+        try
+        {
+            using var reader = file.SafeCreateReader();
+            if (reader == null) return false;
+            using var fs = File.Create(outPath);
+            reader.CopyTo(fs, 1 << 20);
+            return true;
+        }
+        catch
+        {
+            // A half-written stream is worse than no file.
+            try { File.Delete(outPath); } catch { }
+            return false;
+        }
+    }
+
+    /// <summary>Stream a provider-side payload at/above <see cref="LargeRawFileBytes"/>
+    /// to *outPath*. Returns false without touching the file when the entry is
+    /// smaller, missing, or unreadable — callers then use the buffered path.</summary>
+    private static bool StreamProviderFileTo(string vfsPath, string outPath)
+    {
+        try
+        {
+            if (!_provider!.TryGetGameFile(vfsPath, out var file) || file == null) return false;
+            if (file.Size < LargeRawFileBytes) return false;
+            return StreamGameFileTo(file, outPath);
+        }
+        catch
+        {
+            try { File.Delete(outPath); } catch { }
+            return false;
+        }
+    }
+
     // ─── FileMediaSource export ───────────────────────────────────────
     private static bool ExportFileMediaSource(string gamePath, string outputDir)
     {
@@ -1574,14 +2444,21 @@ internal static class Program
             Respond(new { type = "warning", message = $"{Path.GetFileName(gamePath)}: {err ?? "FileMediaSource resolve failed"}" });
             return false;
         }
+        var name = SanitizeName(Path.GetFileName(resolved));
+        if (string.IsNullOrEmpty(name)) return false;
+        var outPath = SafeJoin(outputDir, name);
+
+        // Stream large payloads (videos) straight to disk before any buffering
+        // happens — a 2 GB cutscene must never be resident as one byte[].
+        // StreamProviderFileTo declines small entries, so the buffered write
+        // below stays the default path for normal assets.
+        if (StreamProviderFileTo(resolved, outPath)) return true;
+
         if (!_provider!.TrySaveAsset(resolved, out var data) || data == null)
         {
             Respond(new { type = "warning", message = $"{Path.GetFileName(gamePath)}: resolved {resolved} not in VFS" });
             return false;
         }
-        var name = SanitizeName(Path.GetFileName(resolved));
-        if (string.IsNullOrEmpty(name)) return false;
-        var outPath = SafeJoin(outputDir, name);
         File.WriteAllBytes(outPath, data);
         return true;
     }
@@ -1589,7 +2466,13 @@ internal static class Program
     // ─── Mesh export ──────────────────────────────────────────────────
     private static bool ExportMesh(UObject mesh, string outputDir)
     {
-        var options = new ExporterOptions(); // ActorX → PSK/PSKX
+        // psk → ActorX binaries (.psk/.pskx); gltf → glTF 2.0 binary (.glb) via
+        // CUE4Parse-Conversion's SharpGLTF path (geometry, bones, weights,
+        // morphs; default-color materials — textures are exported separately).
+        var options = new ExporterOptions
+        {
+            MeshFormat = _meshFormat == "gltf" ? EMeshFormat.Gltf2 : EMeshFormat.ActorX,
+        };
         MeshExporter exporter;
         if (mesh is UStaticMesh staticMesh)
             exporter = new MeshExporter(staticMesh, options);
@@ -1622,9 +2505,29 @@ internal static class Program
         // Decode() now yields a CTexture (raw pixels + format) rather than an
         // SKBitmap. Convert once here so the TGA/PNG writers below stay as they
         // were rather than growing a second pixel-format path.
-        var raw = texture.Decode();
+        // GPU decode: when enabled (initialized by init/export "gpu" flag),
+        // ask the Vulkan-based decoder first; it returns null (with a reason
+        // logged to stderr) for anything it can't handle — virtual textures,
+        // volumetrics, unsupported formats, per-texture GPU errors — and the
+        // CPU path below takes over.
+        CTexture? raw;
+        if (_gpuDecode)
+        {
+            raw = GpuTextureDecoder.TryDecode(texture, out _);
+            if (raw == null)
+                raw = texture.Decode();
+        }
+        else
+        {
+            raw = texture.Decode();
+        }
         if (raw == null) return false;
-        var decoded = TextureEncoder.ToSkBitmap(raw);
+        // SKBitmap/SKData wrap native Skia memory that the GC never sees. Without
+        // explicit Dispose the native buffers only get freed when a gen2 GC runs
+        // one of SKObject's finalizers — which never happens during a texture-heavy
+        // export (the managed heap stays tiny), so RSS grows unbounded at
+        // ~16 MB / 2K texture, ~65 MB / 4K texture until the process OOMs.
+        using var decoded = TextureEncoder.ToSkBitmap(raw);
         if (decoded == null) return false;
 
         if (_textureFormat == "tga")
@@ -1633,11 +2536,80 @@ internal static class Program
             var outPath = SafeJoin(outputDir, $"{texture.Name}.tga");
             WriteTga(decoded, outPath);
         }
+        else if (_textureFormat == "webp")
+        {
+            var outPath = SafeJoin(outputDir, $"{texture.Name}.webp");
+            var wrotePixels = false;
+            try
+            {
+                // Lossless keeps pixels bit-exact (default); lossy trades a
+                // tiny quality loss for a much smaller file, quality 1-100.
+                using var pixels = decoded.PeekPixels();
+                if (pixels != null)
+                {
+                    var mode = _webpLossless
+                        ? new SkiaSharp.SKWebpEncoderOptions(
+                            SkiaSharp.SKWebpEncoderCompression.Lossless, 100)
+                        : new SkiaSharp.SKWebpEncoderOptions(
+                            SkiaSharp.SKWebpEncoderCompression.Lossy, _webpQuality);
+                    using var data = pixels.Encode(mode);
+                    if (data != null && data.Size > 0)
+                    {
+                        using var fs = File.Create(outPath);
+                        data.SaveTo(fs);
+                        wrotePixels = true;
+                    }
+                }
+            }
+            finally
+            {
+                if (!wrotePixels)
+                {
+                    // Non-raster color type or encoder failure — the generic
+                    // Skia image-encode path is still correct, just slower.
+                    using var webpData = decoded.Encode(SkiaSharp.SKEncodedImageFormat.Webp, _webpQuality);
+                    using var fs = File.Create(outPath);
+                    webpData.SaveTo(fs);
+                }
+            }
+        }
         else
         {
             var outPath = SafeJoin(outputDir, $"{texture.Name}.png");
-            using var fs = File.Create(outPath);
-            decoded.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100).SaveTo(fs);
+            var wrotePixels = false;
+            try
+            {
+                // Fast PNG: SKPngEncoderOptions lets us pick a cheap zlib level.
+                // The generic Encode(format, 100) path (quality is ignored for
+                // PNG) runs zlib at its default level (~6) over all five row
+                // filters — 3-4x the CPU time of level 1 + the cheap Sub
+                // filter, for output roughly 10-20% larger. Texture-heavy
+                // batches are encode-bound, so the tradeoff pays off heavily
+                // (fast PNG is the agreed default).
+                using var pixels = decoded.PeekPixels();
+                if (pixels != null)
+                {
+                    using var data = pixels.Encode(new SkiaSharp.SKPngEncoderOptions(
+                        SkiaSharp.SKPngEncoderFilterFlags.Sub, 1));
+                    if (data != null && data.Size > 0)
+                    {
+                        using var fs = File.Create(outPath);
+                        data.SaveTo(fs);
+                        wrotePixels = true;
+                    }
+                }
+            }
+            finally
+            {
+                if (!wrotePixels)
+                {
+                    // Non-raster color type or encoder failure — the old
+                    // generic path is still correct, just slower.
+                    using var pngData = decoded.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+                    using var fs = File.Create(outPath);
+                    pngData.SaveTo(fs);
+                }
+            }
         }
         return true;
     }
@@ -1645,7 +2617,11 @@ internal static class Program
     private static void WriteTga(SkiaSharp.SKBitmap bmp, string outPath)
     {
         int w = bmp.Width, h = bmp.Height;
-        using var fs = File.Create(outPath);
+        // 1 MB buffer: the pixel block write below lands on the OS in a few
+        // big chunks instead of streaming multi-MB driver buffer arrays
+        // straight to the pipe (relevant on Windows named-pipe flushes and
+        // Linux socket-backed pipes alike).
+        using var fs = new BufferedStream(File.Create(outPath), 1024 * 1024);
         // TGA header (18 bytes)
         var header = new byte[18];
         header[2] = 2;  // Uncompressed true-color
@@ -1657,22 +2633,44 @@ internal static class Program
         header[17] = 0x28; // top-left origin + 8 alpha bits
         fs.Write(header);
 
-        // Pixel data — BGRA. Skia's default 8888 layout is BGRA on little-endian
-        // platforms, matching the TGA output we want, so we can write the
-        // backing buffer directly. For other layouts, fall back to per-pixel.
-        if (bmp.ColorType == SkiaSharp.SKColorType.Bgra8888 ||
-            (bmp.ColorType == SkiaSharp.SKColorType.Rgba8888 && BitConverter.IsLittleEndian))
+        // Skia's default 8888 layout is BGRA on little-endian platforms,
+        // matching the TGA output we want, so we can write the backing buffer
+        // directly. (Copies bmp.Bytes once — inherent to the SKBitmap wrap.)
+        if (bmp.ColorType == SkiaSharp.SKColorType.Bgra8888)
         {
-            // Bgra8888: bytes are already in B,G,R,A order regardless of endian.
-            if (bmp.ColorType == SkiaSharp.SKColorType.Bgra8888)
-            {
-                fs.Write(bmp.Bytes);
-                return;
-            }
-            // Rgba8888 little-endian: swap R<->B per pixel into a scratch buffer.
+            fs.Write(bmp.Bytes);
+            return;
         }
 
-        // Fallback: per-pixel write using GetPixel.
+        // Rgba8888: swap R<->B per pixel into a scratch buffer with plain
+        // 4-byte-group loops. The old code fell through here to a
+        // per-pixel GetPixel+WriteByte fallback — two bounds-checked native
+        // calls per pixel, minutes per 4K texture within a batch of
+        // thousands. Green/alpha bytes pass through untouched.
+        if (bmp.ColorType == SkiaSharp.SKColorType.Rgba8888)
+        {
+            var src = bmp.Bytes;
+            var scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(src.Length);
+            try
+            {
+                for (int i = 0; i + 3 < src.Length; i += 4)
+                {
+                    scratch[i] = src[i + 2];
+                    scratch[i + 1] = src[i + 1];
+                    scratch[i + 2] = src[i];
+                    scratch[i + 3] = src[i + 3];
+                }
+                fs.Write(scratch, 0, src.Length);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(scratch);
+            }
+            return;
+        }
+
+        // Unexpected color type — keep the exact per-pixel read path so the
+        // output stays correct, per-pixel cost is irrelevant at this rarity.
         for (int y = 0; y < h; y++)
         {
             for (int x = 0; x < w; x++)
@@ -1730,6 +2728,29 @@ internal static class Program
                 "OGG" or "OPUS" => "ogg",
                 _ => "wav"
             };
+
+            // MP3/WebM targets re-encode through ffmpeg (same chain as the
+            // WEM path); without ffmpeg the native decode stays as the
+            // playable fallback.
+            if (_audioFormat is "mp3" or "webm")
+            {
+                InitFfmpeg();
+                if (_ffmpegPath != null)
+                {
+                    var nativeTempPath = SafeJoin(outputDir, $"{sound.Name}.{nativeExt}");
+                    File.WriteAllBytes(nativeTempPath, data);
+                    var targetPath = SafeJoin(outputDir, $"{sound.Name}.{_audioFormat}");
+                    if (EncodeWithFfmpeg(nativeTempPath, targetPath, _audioFormat))
+                    {
+                        try { File.Delete(nativeTempPath); } catch { }
+                        return true;
+                    }
+                    // Encode failed — keep the native file.
+                    return true;
+                }
+                Respond(new { type = "warning", message = "ffmpeg unavailable; exporting native audio instead of " + _audioFormat });
+            }
+
             var outPath = SafeJoin(outputDir, $"{sound.Name}.{nativeExt}");
             File.WriteAllBytes(outPath, data);
             return true;
@@ -1832,7 +2853,7 @@ internal static class Program
     }
 
     private static void ExportDependencies(HashSet<string> refPaths, string outputDir,
-        Dictionary<string, bool> formats, HashSet<string> visited, int depth)
+        Dictionary<string, bool> formats, ConcurrentSet visited, int depth)
     {
         foreach (var refPath in refPaths)
         {
@@ -2108,17 +3129,46 @@ internal static class Program
         }
     }
 
-    /// <summary>Convert an audio file to WAV (or OGG if vgmstream supports it) using vgmstream-cli.</summary>
+    /// <summary>Normalize a target audio-format string to a supported kind.</summary>
+    private static string NormalizeAudioFormat(string raw)
+    {
+        var v = (raw ?? "").Trim().ToLowerInvariant();
+        return v is "mp3" or "webm" or "ogg" ? v : "wav";
+    }
+
+    /// <summary>
+    /// Decode an exported audio blob to the target format.
+    ///
+    /// vgmstream-cli (r1980) only *decodes* — it writes WAV (or OGG for native
+    /// pcm/vorbis sources). For MP3/WebM targets the decode lands in an
+    /// intermediate WAV that ffmpeg then re-encodes; on any ffmpeg failure the
+    /// WAV is kept as a fallback so the user still gets playable audio.
+    /// </summary>
     private static bool ConvertWithVgmstream(string inputPath, string outputDir, string targetFormat)
     {
         InitVgmstream();
         if (_vgmstreamPath == null) return false;
 
         var baseName = Path.GetFileNameWithoutExtension(inputPath);
-        // vgmstream always outputs WAV. SafeJoin enforces containment in case
-        // baseName carries traversal from an upstream filename.
+        // SafeJoin enforces containment in case baseName carries traversal
+        // from an upstream filename.
         var outPath = SafeJoin(outputDir, $"{baseName}.wav");
 
+        // MP3/WebM need an ffmpeg pass; without ffmpeg (download failed, no
+        // network) fall back to WAV rather than silently producing nothing.
+        var format = NormalizeAudioFormat(targetFormat);
+        var needsFfmpeg = format is "mp3" or "webm";
+        if (needsFfmpeg)
+        {
+            InitFfmpeg();
+            if (_ffmpegPath == null)
+            {
+                Respond(new { type = "warning", message = "ffmpeg unavailable; exporting WAV instead of " + format });
+                needsFfmpeg = false;
+            }
+        }
+
+        bool decoded;
         try
         {
             var psi = new ProcessStartInfo
@@ -2137,12 +3187,370 @@ internal static class Program
 
             using var proc = Process.Start(psi);
             if (proc == null) return false;
-            proc.WaitForExit(30_000);
-            return proc.ExitCode == 0 && File.Exists(outPath);
+            // Drain both pipes as they fill: with RedirectStandardOutput/Error
+            // enabled but unread, a child that writes more than the OS pipe
+            // buffer (progress/chatter) blocks forever on write — and the
+            // waiting parent leaves a live leaked process holding the decoded
+            // audio in memory. Draining must overlap the wait, not follow it.
+            var soDrain = proc.StandardOutput.ReadToEndAsync();
+            var seDrain = proc.StandardError.ReadToEndAsync();
+            if (!proc.WaitForExit(30_000))
+            {
+                // Timed out — the child (and its buffers) must die, or every
+                // such conversion permanently leaks a running process.
+                try { proc.Kill(entireProcessTree: true); } catch { /* already dead */ }
+            }
+            // Reading ExitCode on a still-running process throws; settle the
+            // drain tasks (and the process) before touching state.
+            try
+            {
+                soDrain.Wait(5_000);
+                seDrain.Wait(5_000);
+            }
+            catch { /* drain failures are best-effort */ }
+            if (!proc.HasExited)
+            {
+                try { proc.WaitForExit(5_000); } catch { }
+            }
+            decoded = proc.HasExited && proc.ExitCode == 0 && File.Exists(outPath);
         }
         catch (Exception ex)
         {
             Respond(new { type = "warning", message = $"vgmstream conversion failed for {Path.GetFileName(inputPath)}: {SanitizeMessage(ex.Message)}" });
+            return false;
+        }
+
+        if (!decoded) return false;
+        if (!needsFfmpeg) return true;
+
+        // Re-encode the intermediate WAV to the requested container. Keeping
+        // the WAV on failure doubles as the fallback above; a successful
+        // encode deletes it so no stray file lingers next to the MP3/WebM.
+        var targetPath = SafeJoin(outputDir, $"{baseName}.{format}");
+        var encoded = EncodeWithFfmpeg(outPath, targetPath, format);
+        if (encoded)
+        {
+            try { File.Delete(outPath); } catch { /* keep fallback */ }
+        }
+        return true;
+    }
+
+    /// <summary>Re-encode a WAV to MP3 (libmp3lame VBR q2) or WebM (Opus 192k) with ffmpeg.</summary>
+    private static bool EncodeWithFfmpeg(string inputPath, string outputPath, string format)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = _ffmpegPath!,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            psi.ArgumentList.Add("-hide_banner");
+            // Errors only — ffmpeg chatters otherwise and would fill the
+            // drained stderr pipe for no gain.
+            psi.ArgumentList.Add("-loglevel");
+            psi.ArgumentList.Add("error");
+            psi.ArgumentList.Add("-y");
+            psi.ArgumentList.Add("-i");
+            psi.ArgumentList.Add(inputPath);
+            if (format == "mp3")
+            {
+                // VBR quality 2 (~190 kbps): default-quality music rips.
+                psi.ArgumentList.Add("-c:a");
+                psi.ArgumentList.Add("libmp3lame");
+                psi.ArgumentList.Add("-q:a");
+                psi.ArgumentList.Add("2");
+            }
+            else // webm
+            {
+                // Opus in WebM is the universally playable pair (Vorbis is
+                // only "allowed" historically). 192k CBR target; libopus is
+                // internally VBR anyway.
+                psi.ArgumentList.Add("-c:a");
+                psi.ArgumentList.Add("libopus");
+                psi.ArgumentList.Add("-b:a");
+                psi.ArgumentList.Add("192k");
+            }
+            psi.ArgumentList.Add(outputPath);
+
+            using var proc = Process.Start(psi);
+            if (proc == null) return false;
+            // Same drain discipline as the vgmstream child above: pipes are
+            // drained concurrently with the wait and the process tree is
+            // killed on timeout — no child may leak past the request.
+            var soDrain = proc.StandardOutput.ReadToEndAsync();
+            var seDrain = proc.StandardError.ReadToEndAsync();
+            if (!proc.WaitForExit(120_000))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { /* already dead */ }
+            }
+            try
+            {
+                soDrain.Wait(5_000);
+                seDrain.Wait(5_000);
+            }
+            catch { /* drain failures are best-effort */ }
+            if (!proc.HasExited)
+            {
+                try { proc.WaitForExit(5_000); } catch { }
+            }
+
+            var ok = proc.HasExited && proc.ExitCode == 0 &&
+                     File.Exists(outputPath) && new FileInfo(outputPath).Length > 0;
+            if (!ok)
+            {
+                // Never leave a rejected/corrupt target file behind.
+                try { File.Delete(outputPath); } catch { }
+            }
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            Respond(new { type = "warning", message = $"ffmpeg encode failed for {Path.GetFileName(inputPath)}: {SanitizeMessage(ex.Message)}" });
+            return false;
+        }
+    }
+
+    // ─── ffmpeg (MP3/WebM encode) ─────────────────────────────────────
+
+    /// <summary>
+    /// Ensure ffmpeg + libs are materialized in the shared cache dir, or
+    /// leave _ffmpegPath null so callers fall back to WAV.
+    /// Serializes the (90 MB) one-shot download across parallel export
+    /// workers; the vgmstream equivalent above lacks the lock because it
+    /// buffers in memory — the streaming archive file here makes races
+    /// matter, so double-check under lock.
+    /// </summary>
+    private static void InitFfmpeg()
+    {
+        if (_ffmpegPath != null) return;
+        lock (_ffmpegInitLock)
+        {
+            if (_ffmpegPath != null) return; // double-checked: another worker won
+
+            var cacheDir = Path.Combine(Path.GetTempPath(), "CUE4ParseCLI_ffmpeg");
+            var exeName = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
+            var readyMarker = Path.Combine(cacheDir, "ffmpeg.ready");
+
+            // The marker is written only after a fully verified download +
+            // extract, so a half-extracted cache can never be mistaken for
+            // a complete one.
+            var exePath = LocateFfmpegExe(cacheDir, exeName);
+            if (exePath != null && File.Exists(readyMarker))
+            {
+                _ffmpegPath = exePath;
+                return;
+            }
+
+            Directory.CreateDirectory(cacheDir);
+            Respond(new { type = "info", message = "Downloading ffmpeg (~90 MB) for MP3/WebM audio export — one time, cached next run" });
+
+            var archivePath = Path.Combine(cacheDir, "ffmpeg.archive");
+            try
+            {
+                // Stream to disk while hashing: the ~90 MB archive must not
+                // sit in a managed byte[] (one per racing worker would multi-
+                // ply the spike), and hash verification still covers the
+                // complete bytes before anything is extracted.
+                var expectedHash = FfmpegArchiveSha256Active;
+                using (var hash = System.Security.Cryptography.IncrementalHash.CreateHash(
+                           System.Security.Cryptography.HashAlgorithmName.SHA256))
+                {
+                    using (var http = new HttpClient())
+                    {
+                        // Body read isn't covered by ReadAsByteArrayAsync's
+                        // short default; a slow 90 MB transfer needs slack.
+                        http.Timeout = TimeSpan.FromMinutes(10);
+                        http.DefaultRequestHeaders.UserAgent.ParseAdd("CUE4ParseCLI/1.0");
+                        using var resp = http.GetAsync(FfmpegArchiveUrlActive, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+                        resp.EnsureSuccessStatusCode();
+                        using var content = resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+                        using var fs = File.Create(archivePath);
+                        content.CopyTo(fs);
+                        // Hash must also see the bytes on disk — fs flushes
+                        // before HashFinal below.
+                    }
+                    using (var verify = File.OpenRead(archivePath))
+                    {
+                        var buffer = new byte[1 << 20];
+                        int read;
+                        while ((read = verify.Read(buffer, 0, buffer.Length)) > 0)
+                            hash.AppendData(buffer, 0, read);
+                    }
+                    var actualHash = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+                    if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Respond(new { type = "warning", message = $"ffmpeg download hash mismatch (expected {expectedHash}, got {actualHash}). Refusing to extract." });
+                        try { File.Delete(archivePath); } catch { }
+                        return;
+                    }
+                }
+
+                // zip on Windows (ZipArchive, zip-slip checked per entry);
+                // tar.xz on Linux via the system tar — no gzip/xz decoder in
+                // the BCL, and every Linux desktop has tar+liblzma.
+                if (OperatingSystem.IsWindows())
+                {
+                    using var zipStream = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.None);
+                    using var zip = new ZipArchive(zipStream, ZipArchiveMode.Read);
+                    if (!TryExtractZipEntries(zip, cacheDir, "ffmpeg"))
+                    {
+                        try { File.Delete(archivePath); } catch { }
+                        return;
+                    }
+                }
+                else
+                {
+                    if (!ExtractTarXz(archivePath, cacheDir))
+                    {
+                        try { File.Delete(archivePath); } catch { }
+                        return;
+                    }
+                }
+
+                // Re-discover: the versioned root dir name includes the ffmpeg
+                // build id, so the exe path can't be assumed up front.
+                exePath = LocateFfmpegExe(cacheDir, exeName);
+
+                if (!OperatingSystem.IsWindows() && exePath != null)
+                {
+                    try
+                    {
+                        File.SetUnixFileMode(exePath,
+                            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                            UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                            UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+                    }
+                    catch (Exception ex)
+                    {
+                        Respond(new { type = "warning", message = $"Could not mark ffmpeg executable: {SanitizeMessage(ex.Message)}" });
+                    }
+                }
+
+                if (exePath != null)
+                {
+                    File.WriteAllBytes(readyMarker, Array.Empty<byte>());
+                    _ffmpegPath = exePath;
+                    Respond(new { type = "info", message = "ffmpeg downloaded and ready" });
+                }
+                else
+                {
+                    Respond(new { type = "warning", message = $"ffmpeg archive extracted but {exeName} not found" });
+                }
+            }
+            catch (Exception ex)
+            {
+                Respond(new { type = "warning", message = $"ffmpeg download failed: {SanitizeMessage(ex.Message)}. Audio stays WAV." });
+            }
+            finally
+            {
+                // The archive is 90 MB of temp disk nobody reuses: extraction
+                // (or its failure) is the only stage that needs it.
+                try { File.Delete(archivePath); } catch { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Shared-build archives extract as one versioned root dir
+    /// (``ffmpeg-n8.1.3-…-{win64|linux64}/bin/ffmpeg[.exe]``), so the
+    /// exe must be located rather than assumed. Returns null when absent.
+    /// </summary>
+    private static string? LocateFfmpegExe(string cacheDir, string exeName)
+    {
+        if (!Directory.Exists(cacheDir)) return null;
+        foreach (var binDir in Directory.EnumerateDirectories(cacheDir, "bin", SearchOption.AllDirectories))
+        {
+            var candidate = Path.Combine(binDir, exeName);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+
+    /// <summary>zip-slip-checked extraction shared with the naive vgmstream flow.</summary>
+    private static bool TryExtractZipEntries(ZipArchive zip, string destDir, string logTag)
+    {
+        foreach (var entry in zip.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.FullName)) continue;
+            // Directory entries end with '/'; create the dir then continue.
+            var isDirectoryEntry = entry.FullName.EndsWith('/') || entry.FullName.EndsWith('\\');
+            string destPath;
+            try { destPath = SafeJoin(destDir, entry.FullName); }
+            catch (InvalidOperationException ex)
+            {
+                Respond(new { type = "warning", message = $"{logTag} zip rejected entry: {SanitizeMessage(ex.Message)}" });
+                return false;
+            }
+
+            if (isDirectoryEntry)
+            {
+                Directory.CreateDirectory(destPath);
+                continue;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+            using var entryStream = entry.Open();
+            using var fs = File.Create(destPath);
+            entryStream.CopyTo(fs);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Extract a .tar.xz via the system tar. Requires tar+liblzma (present on
+    /// every mainstream Linux desktop); failure returns false so the caller
+    /// cleans up and falls back to WAV. Exchange: output stays silent —
+    /// stderr is drained concurrently with the wait so a chatty tar can't
+    /// wedge the pipe.
+    /// </summary>
+    private static bool ExtractTarXz(string archivePath, string destDir)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "/usr/bin/env",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            psi.ArgumentList.Add("tar");
+            psi.ArgumentList.Add("-xJf");
+            psi.ArgumentList.Add(archivePath);
+            psi.ArgumentList.Add("-C");
+            psi.ArgumentList.Add(destDir);
+
+            using var proc = Process.Start(psi);
+            if (proc == null) return false;
+            var seDrain = proc.StandardError.ReadToEndAsync();
+            var soDrain = proc.StandardOutput.ReadToEndAsync();
+            // tar on a 70 MB xz payload is fast, but give slow disks room —
+            // a stuck extract is killed, not leaked (same discipline as the
+            // conversion children).
+            if (!proc.WaitForExit(600_000))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { /* already dead */ }
+            }
+            try
+            {
+                soDrain.Wait(5_000);
+                seDrain.Wait(5_000);
+            }
+            catch { /* drain failures are best-effort */ }
+            if (!proc.HasExited)
+            {
+                try { proc.WaitForExit(5_000); } catch { }
+            }
+            return proc.HasExited && proc.ExitCode == 0 && Directory.Exists(Path.Combine(destDir, "bin"));
+        }
+        catch (Exception ex)
+        {
+            Respond(new { type = "warning", message = $"ffmpeg tar extraction failed: {SanitizeMessage(ex.Message)}" });
             return false;
         }
     }
@@ -2412,26 +3820,31 @@ internal static class Program
     private static void EnsureWemNameMap()
     {
         if (_wemMapBuilt) return;
-        _wemMapBuilt = true;
-
-        // Try loading from the disk cache (survives across sessions for the same game)
-        if (_wemNameCachePath != null && File.Exists(_wemNameCachePath))
+        lock (_wemMapLock)
         {
-            try
-            {
-                var json = File.ReadAllText(_wemNameCachePath);
-                var cached = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
-                if (cached != null && cached.Count > 0)
-                {
-                    _wemIdToName = cached;
-                    Respond(new { type = "info", message = $"WEM names: loaded {_wemIdToName.Count} entries from cache" });
-                    return;
-                }
-            }
-            catch { /* ignore corrupt cache — fall through to rebuild */ }
-        }
+            if (_wemMapBuilt) return;
 
-        BuildWemNameMapFromBanks();
+            // Try loading from the disk cache (survives across sessions for the same game)
+            if (_wemNameCachePath != null && File.Exists(_wemNameCachePath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(_wemNameCachePath);
+                    var cached = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                    if (cached != null && cached.Count > 0)
+                    {
+                        _wemIdToName = cached;
+                        _wemMapBuilt = true;
+                        Respond(new { type = "info", message = $"WEM names: loaded {_wemIdToName.Count} entries from cache" });
+                        return;
+                    }
+                }
+                catch { /* ignore corrupt cache — fall through to rebuild */ }
+            }
+
+            BuildWemNameMapFromBanks();
+            _wemMapBuilt = true;
+        }
     }
 
     // ─── Scan WWise AkAudioEvent assets ───────────────────────────────
@@ -2602,89 +4015,142 @@ internal static class Program
     /// </summary>
     private static Task HandleExportWwiseAudio(JObject cmd)
     {
+        // Extracted .wem payloads are sizable; honor the parent's memory
+        // policy and gate each entry through it.
+        ResolveMemoryPolicy(cmd, adaptDop: false);
         EnsureProvider();
         var outputDir = cmd.Value<string>("output_dir") ?? throw new ArgumentException("output_dir required");
-        var audioFormat = cmd.Value<string>("audio_format") ?? "wav";
+        var audioFormat = NormalizeAudioFormat(cmd.Value<string>("audio_format") ?? "wav");
         var entries = cmd["entries"] as JArray ?? throw new ArgumentException("entries required");
 
         _audioFormat = audioFormat;
         Directory.CreateDirectory(outputDir);
 
-        int total = entries.Count, current = 0;
-        var succeeded = new List<string>();
-        var failed = new List<object>();
+        // Local degree of parallelism — do NOT touch the global _exportThreads
+        // here: audio exports run via RunExportWithCancelSupport while another
+        // export/scan may still be draining queued commands, and clobbering the
+        // global would desync the serialize-thread cap for concurrent work.
+        var dop = ResolveExportThreads(cmd);
+
+        var total = entries.Count;
+        int current = 0;
+        var succeeded = new ConcurrentQueue<string>();
+        var failed = new ConcurrentQueue<object>();
+        // Guards the "resolve entry → claim output name" step so duplicate
+        // target names fail deterministically instead of racing on the same
+        // .wem/.wav paths (sequential code was last-write-wins by accident).
+        var claimedOutputs = new ConcurrentSet();
+        var claimLock = new object();
+        var pacer = new ProgressPacer();
 
         Respond(new { type = "progress", current = 0, total, message = $"Exporting {total} audio files..." });
 
-        foreach (var entry in entries)
+        try
         {
-            if (_cts.Token.IsCancellationRequested) break;
-            current++;
-
-            var wemPath = entry.Value<string>("wem_vfs_path") ?? "";
-            var targetName = entry.Value<string>("target_name") ?? "";
-            var targetFolder = entry.Value<string>("target_folder") ?? "";
-
-            // Sanitize parent-supplied path components: each folder segment is
-            // run through SanitizeName, traversal segments are rejected, and
-            // SafeJoin enforces containment in outputDir.
-            var safeName = SanitizeName(targetName);
-            if (string.IsNullOrEmpty(safeName))
+            Parallel.ForEach(entries, new ParallelOptions
             {
-                failed.Add(new { path = wemPath, error = "Invalid target_name" });
-                continue;
-            }
-
-            string safeSubDir;
-            try
+                MaxDegreeOfParallelism = dop,
+                CancellationToken = _cts.Token
+            },
+            entry =>
             {
-                safeSubDir = SafeJoinFolderSegments(outputDir, targetFolder);
-            }
-            catch (Exception ex)
-            {
-                failed.Add(new { path = wemPath, error = $"Invalid target_folder: {SanitizeMessage(ex.Message)}" });
-                continue;
-            }
+                var done = Interlocked.Increment(ref current);
 
-            if (current % 10 == 0 || current == total)
-                Respond(new { type = "progress", current, total, message = $"Exporting audio: {safeName}" });
+                var wemPath = entry.Value<string>("wem_vfs_path") ?? "";
+                var targetName = entry.Value<string>("target_name") ?? "";
+                var targetFolder = entry.Value<string>("target_folder") ?? "";
 
-            try
-            {
-                if (!_provider!.TrySaveAsset(wemPath, out var data))
+                // Memory gate: extracted banks park whole .wem payloads in
+                // managed memory before conversion, so back off near the cap.
+                try { WaitUnderMemoryGate(_cts.Token); }
+                catch (MemoryLimitExceededException mle)
                 {
-                    failed.Add(new { path = wemPath, error = "File not found in VFS" });
-                    continue;
+                    failed.Enqueue(new { path = wemPath, error = SanitizeMessage(mle.Message) });
+                    return;
                 }
 
-                Directory.CreateDirectory(safeSubDir);
-
-                var wemTempPath = SafeJoin(safeSubDir, $"{safeName}.wem");
-                File.WriteAllBytes(wemTempPath, data);
-
-                var converted = ConvertWithVgmstream(wemTempPath, safeSubDir, audioFormat);
-                if (converted)
+                // Sanitize parent-supplied path components: each folder segment is
+                // run through SanitizeName, traversal segments are rejected, and
+                // SafeJoin enforces containment in outputDir.
+                var safeName = SanitizeName(targetName);
+                if (string.IsNullOrEmpty(safeName))
                 {
-                    try { File.Delete(wemTempPath); } catch { }
+                    failed.Enqueue(new { path = wemPath, error = "Invalid target_name" });
+                    return;
                 }
-                // Keep .wem as fallback if conversion failed
-                succeeded.Add(safeName);
-            }
-            catch (Exception ex)
-            {
-                failed.Add(new { path = wemPath, error = SanitizeMessage(ex.Message) });
-            }
+
+                string safeSubDir;
+                try
+                {
+                    safeSubDir = SafeJoinFolderSegments(outputDir, targetFolder);
+                }
+                catch (Exception ex)
+                {
+                    failed.Enqueue(new { path = wemPath, error = $"Invalid target_folder: {SanitizeMessage(ex.Message)}" });
+                    return;
+                }
+
+                // Claim the unique output key (.wem temp + final .wav both stem
+                // from safeSubDir + safeName) before doing any work.
+                var outKey = $"{safeSubDir}::{safeName}";
+                lock (claimLock)
+                {
+                    if (!claimedOutputs.Add(outKey))
+                    {
+                        failed.Enqueue(new { path = wemPath, error = "Duplicate target name in folder" });
+                        return;
+                    }
+                }
+
+                pacer.Emit(done, total, $"Exporting audio: {safeName}");
+
+                try
+                {
+                    Directory.CreateDirectory(safeSubDir);
+
+                    var wemTempPath = SafeJoin(safeSubDir, $"{safeName}.wem");
+
+                    // Stream the payload to its temp file rather than holding
+                    // the whole .wem in managed memory — large banks are the
+                    // audio pipeline's biggest allocation.
+                    if (!StreamProviderFileTo(wemPath, wemTempPath))
+                    {
+                        if (!_provider!.TrySaveAsset(wemPath, out var data) || data == null)
+                        {
+                            failed.Enqueue(new { path = wemPath, error = "File not found in VFS" });
+                            return;
+                        }
+                        File.WriteAllBytes(wemTempPath, data);
+                    }
+
+                    var converted = ConvertWithVgmstream(wemTempPath, safeSubDir, audioFormat);
+                    if (converted)
+                    {
+                        try { File.Delete(wemTempPath); } catch { }
+                    }
+                    // Keep .wem as fallback if conversion failed
+                    succeeded.Enqueue(safeName);
+                }
+                catch (Exception ex)
+                {
+                    failed.Enqueue(new { path = wemPath, error = SanitizeMessage(ex.Message) });
+                }
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when the user cancels — fall through to the payload below.
         }
 
         var cancelled = _cts.Token.IsCancellationRequested;
         Respond(new
         {
             type = "export_done",
-            succeeded,
-            failed,
+            succeeded = succeeded.ToList(),
+            failed = failed.ToList(),
             total = entries.Count,
             cancelled,
-            remaining = cancelled ? entries.Count - current : 0,
+            remaining = cancelled ? total - Volatile.Read(ref current) : 0,
             warning_count = 0,
         });
         return Task.CompletedTask;
@@ -2697,30 +4163,40 @@ internal static class Program
     /// used in place; VFS-packed banks are extracted once per session into a
     /// temp cache (cleared on init).
     /// </summary>
+    // Serializes cache lookup/materialization — HandleExportFmodAudio workers
+    // run concurrently and frequently target subsongs of the SAME bank, so the
+    // _fmodBankCache dictionary now needs thread-safe access, not just
+    // deduped materialization.
+    private static readonly object _fmodBankCacheLock = new();
+
     private static string? GetFmodBankLocalPath(string vfsPath, out string? error)
     {
         error = null;
         if (_looseFiles.TryGetValue(vfsPath, out var diskPath) && File.Exists(diskPath))
             return diskPath;
-        if (_fmodBankCache.TryGetValue(vfsPath, out var cached) && File.Exists(cached))
-            return cached;
 
-        if (_provider == null || !_provider.TrySaveAsset(vfsPath, out var data) || data == null)
+        lock (_fmodBankCacheLock)
         {
-            error = "Bank not found in VFS";
-            return null;
-        }
+            if (_fmodBankCache.TryGetValue(vfsPath, out var cached) && File.Exists(cached))
+                return cached;
 
-        var cacheDir = Path.Combine(Path.GetTempPath(), "CUE4ParseCLI_fmod");
-        Directory.CreateDirectory(cacheDir);
-        // Hash prefix keeps same-named banks from different folders apart.
-        var hash = ComputeSha256Hex(System.Text.Encoding.UTF8.GetBytes(vfsPath))[..16];
-        var name = SanitizeName(Path.GetFileName(vfsPath));
-        if (string.IsNullOrEmpty(name)) name = "bank.bank";
-        var tempPath = Path.Combine(cacheDir, $"{hash}_{name}");
-        File.WriteAllBytes(tempPath, data);
-        _fmodBankCache[vfsPath] = tempPath;
-        return tempPath;
+            if (_provider == null || !_provider.TrySaveAsset(vfsPath, out var data) || data == null)
+            {
+                error = "Bank not found in VFS";
+                return null;
+            }
+
+            var cacheDir = Path.Combine(Path.GetTempPath(), "CUE4ParseCLI_fmod");
+            Directory.CreateDirectory(cacheDir);
+            // Hash prefix keeps same-named banks from different folders apart.
+            var hash = ComputeSha256Hex(System.Text.Encoding.UTF8.GetBytes(vfsPath))[..16];
+            var name = SanitizeName(Path.GetFileName(vfsPath));
+            if (string.IsNullOrEmpty(name)) name = "bank.bank";
+            var tempPath = Path.Combine(cacheDir, $"{hash}_{name}");
+            File.WriteAllBytes(tempPath, data);
+            _fmodBankCache[vfsPath] = tempPath;
+            return tempPath;
+        }
     }
 
     /// <summary>Run vgmstream-cli with captured stdout. Null if it couldn't run.</summary>
@@ -2908,83 +4384,125 @@ internal static class Program
     /// </summary>
     private static void HandleExportFmodAudio(JObject cmd)
     {
+        // Materializing banks to temp files is the audio pipeline's biggest
+        // allocation; honor the parent's memory policy and gate each entry.
+        ResolveMemoryPolicy(cmd, adaptDop: false);
         EnsureProvider();
         var outputDir = cmd.Value<string>("output_dir") ?? throw new ArgumentException("output_dir required");
         var entries = cmd["entries"] as JArray ?? throw new ArgumentException("entries required");
 
         Directory.CreateDirectory(outputDir);
 
-        int total = entries.Count, current = 0;
-        var succeeded = new List<string>();
-        var failed = new List<object>();
+        // Local degree of parallelism — see HandleExportWwiseAudio for why the
+        // global _exportThreads is deliberately not clobbered here.
+        var dop = ResolveExportThreads(cmd);
+
+        var total = entries.Count;
+        int current = 0;
+        var succeeded = new ConcurrentQueue<string>();
+        var failed = new ConcurrentQueue<object>();
+        // Two subsongs of different banks may map to the same output file in
+        // the same target folder; claim output paths so parallel writers don't
+        // interleave bytes into one .wav.
+        var claimedOutputs = new ConcurrentSet();
+        var claimLock = new object();
+        var pacer = new ProgressPacer();
 
         Respond(new { type = "progress", current = 0, total, message = $"Exporting {total} FMOD stream(s)..." });
 
-        foreach (var entry in entries)
+        try
         {
-            if (_cts.Token.IsCancellationRequested) break;
-            current++;
-
-            var bankPath = entry.Value<string>("bank_vfs_path") ?? "";
-            var streamIndex = entry.Value<int?>("stream_index") ?? 0;
-            var targetName = entry.Value<string>("target_name") ?? "";
-            var targetFolder = entry.Value<string>("target_folder") ?? "";
-
-            var safeName = SanitizeName(targetName);
-            if (string.IsNullOrEmpty(safeName) || streamIndex <= 0)
+            Parallel.ForEach(entries, new ParallelOptions
             {
-                failed.Add(new { path = bankPath, error = "Invalid target_name or stream_index" });
-                continue;
-            }
-
-            string safeSubDir;
-            try
+                MaxDegreeOfParallelism = dop,
+                CancellationToken = _cts.Token
+            },
+            entry =>
             {
-                safeSubDir = SafeJoinFolderSegments(outputDir, targetFolder);
-            }
-            catch (Exception ex)
-            {
-                failed.Add(new { path = bankPath, error = $"Invalid target_folder: {SanitizeMessage(ex.Message)}" });
-                continue;
-            }
+                var done = Interlocked.Increment(ref current);
 
-            if (current % 10 == 0 || current == total)
-                Respond(new { type = "progress", current, total, message = $"Exporting FMOD audio: {safeName}" });
+                var bankPath = entry.Value<string>("bank_vfs_path") ?? "";
+                var streamIndex = entry.Value<int?>("stream_index") ?? 0;
+                var targetName = entry.Value<string>("target_name") ?? "";
+                var targetFolder = entry.Value<string>("target_folder") ?? "";
 
-            try
-            {
-                var local = GetFmodBankLocalPath(bankPath, out var err);
-                if (local == null)
+                // Memory gate — banks materialize to whole temp files.
+                try { WaitUnderMemoryGate(_cts.Token); }
+                catch (MemoryLimitExceededException mle)
                 {
-                    failed.Add(new { path = bankPath, error = err ?? "bank unavailable" });
-                    continue;
+                    failed.Enqueue(new { path = $"{bankPath}#{streamIndex}", error = SanitizeMessage(mle.Message) });
+                    return;
                 }
 
-                Directory.CreateDirectory(safeSubDir);
-                var outPath = SafeJoin(safeSubDir, $"{safeName}.wav");
-                var run = RunVgmstreamCapture(new[] { "-s", streamIndex.ToString(), "-o", outPath, local }, 60_000);
-                if (run == null || run.Value.ExitCode != 0 || !File.Exists(outPath))
+                var safeName = SanitizeName(targetName);
+                if (string.IsNullOrEmpty(safeName) || streamIndex <= 0)
                 {
-                    failed.Add(new { path = $"{bankPath}#{streamIndex}", error = "vgmstream conversion failed" });
-                    continue;
+                    failed.Enqueue(new { path = bankPath, error = "Invalid target_name or stream_index" });
+                    return;
                 }
-                succeeded.Add(outPath);
-            }
-            catch (Exception ex)
-            {
-                failed.Add(new { path = $"{bankPath}#{streamIndex}", error = SanitizeMessage(ex.Message) });
-            }
+
+                string safeSubDir;
+                try
+                {
+                    safeSubDir = SafeJoinFolderSegments(outputDir, targetFolder);
+                }
+                catch (Exception ex)
+                {
+                    failed.Enqueue(new { path = bankPath, error = $"Invalid target_folder: {SanitizeMessage(ex.Message)}" });
+                    return;
+                }
+
+                var outKey = $"{safeSubDir}::{safeName}";
+                lock (claimLock)
+                {
+                    if (!claimedOutputs.Add(outKey))
+                    {
+                        failed.Enqueue(new { path = $"{bankPath}#{streamIndex}", error = "Duplicate target name in folder" });
+                        return;
+                    }
+                }
+
+                pacer.Emit(done, total, $"Exporting FMOD audio: {safeName}");
+
+                try
+                {
+                    var local = GetFmodBankLocalPath(bankPath, out var err);
+                    if (local == null)
+                    {
+                        failed.Enqueue(new { path = bankPath, error = err ?? "bank unavailable" });
+                        return;
+                    }
+
+                    Directory.CreateDirectory(safeSubDir);
+                    var outPath = SafeJoin(safeSubDir, $"{safeName}.wav");
+                    var run = RunVgmstreamCapture(new[] { "-s", streamIndex.ToString(), "-o", outPath, local }, 60_000);
+                    if (run == null || run.Value.ExitCode != 0 || !File.Exists(outPath))
+                    {
+                        failed.Enqueue(new { path = $"{bankPath}#{streamIndex}", error = "vgmstream conversion failed" });
+                        return;
+                    }
+                    succeeded.Enqueue(outPath);
+                }
+                catch (Exception ex)
+                {
+                    failed.Enqueue(new { path = $"{bankPath}#{streamIndex}", error = SanitizeMessage(ex.Message) });
+                }
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when the user cancels — fall through to the payload below.
         }
 
         var cancelled = _cts.Token.IsCancellationRequested;
         Respond(new
         {
             type = "export_done",
-            succeeded,
-            failed,
+            succeeded = succeeded.ToList(),
+            failed = failed.ToList(),
             total = entries.Count,
             cancelled,
-            remaining = cancelled ? entries.Count - current : 0,
+            remaining = cancelled ? total - Volatile.Read(ref current) : 0,
             warning_count = 0,
         });
     }
@@ -3001,6 +4519,9 @@ internal static class Program
     /// </summary>
     private static Task HandleExportVideo(JObject cmd)
     {
+        // Video payloads are the largest allocations in the pipeline; honor
+        // the parent's memory policy and gate every entry through it.
+        ResolveMemoryPolicy(cmd, adaptDop: false);
         EnsureProvider();
         var outputDir = cmd.Value<string>("output_dir") ?? throw new ArgumentException("output_dir required");
         var entries = cmd["entries"] as JArray ?? throw new ArgumentException("entries required");
@@ -3016,7 +4537,6 @@ internal static class Program
         foreach (var entry in entries)
         {
             if (_cts.Token.IsCancellationRequested) break;
-            current++;
 
             var vfsPath = entry.Value<string>("vfs_path") ?? "";
             var kind = (entry.Value<string>("kind") ?? "raw_video").ToLowerInvariant();
@@ -3026,6 +4546,16 @@ internal static class Program
                 continue;
             }
 
+            // Memory gate — the per-entry failure path below keeps a single
+            // gate timeout from aborting the remaining video exports.
+            try { WaitUnderMemoryGate(_cts.Token); }
+            catch (MemoryLimitExceededException mle)
+            {
+                failed.Add(new { path = vfsPath, error = SanitizeMessage(mle.Message) });
+                continue;
+            }
+            current++;
+
             if (current % 5 == 0 || current == total)
                 Respond(new { type = "progress", current, total, message = $"Exporting video: {Path.GetFileName(vfsPath)}" });
 
@@ -3033,11 +4563,6 @@ internal static class Program
             {
                 if (kind == "raw_video")
                 {
-                    if (!_provider!.TrySaveAsset(vfsPath, out var data) || data == null)
-                    {
-                        failed.Add(new { path = vfsPath, error = "File not found in VFS" });
-                        continue;
-                    }
                     var name = SanitizeName(Path.GetFileName(vfsPath));
                     if (string.IsNullOrEmpty(name))
                     {
@@ -3045,6 +4570,20 @@ internal static class Program
                         continue;
                     }
                     var outPath = SafeJoin(outputDir, name);
+
+                    // Large videos stream straight to disk — buffering a
+                    // multi-GB cutscene whole is what the memory cap prevents.
+                    if (StreamProviderFileTo(vfsPath, outPath))
+                    {
+                        succeeded.Add(outPath);
+                        continue;
+                    }
+
+                    if (!_provider!.TrySaveAsset(vfsPath, out var data) || data == null)
+                    {
+                        failed.Add(new { path = vfsPath, error = "File not found in VFS" });
+                        continue;
+                    }
                     File.WriteAllBytes(outPath, data);
                     succeeded.Add(outPath);
                     continue;
@@ -3058,11 +4597,6 @@ internal static class Program
                         failed.Add(new { path = vfsPath, error = resolveErr ?? "FileMediaSource resolution failed" });
                         continue;
                     }
-                    if (!_provider!.TrySaveAsset(resolved, out var data) || data == null)
-                    {
-                        failed.Add(new { path = vfsPath, error = $"Resolved file not found: {resolved}" });
-                        continue;
-                    }
                     var name = SanitizeName(Path.GetFileName(resolved));
                     if (string.IsNullOrEmpty(name))
                     {
@@ -3070,6 +4604,18 @@ internal static class Program
                         continue;
                     }
                     var outPath = SafeJoin(outputDir, name);
+
+                    if (StreamProviderFileTo(resolved, outPath))
+                    {
+                        succeeded.Add(outPath);
+                        continue;
+                    }
+
+                    if (!_provider!.TrySaveAsset(resolved, out var data) || data == null)
+                    {
+                        failed.Add(new { path = vfsPath, error = $"Resolved file not found: {resolved}" });
+                        continue;
+                    }
                     File.WriteAllBytes(outPath, data);
                     succeeded.Add(outPath);
                     continue;
@@ -3318,10 +4864,70 @@ internal static class Program
 
     // ─── Helpers ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Force the concurrent-read flag on every mounted VFS reader. CUE4Parse
+    /// sets <c>IsConcurrent=true</c> via PostLoadReader on current builds so
+    /// each Extract clones the container stream instead of sharing one — the
+    /// precondition for parallel package loading. A defensive pass after mount
+    /// guarantees that for any pinned build that does not, at no cost when
+    /// already true. Wrapped in try/catch: listing mounted VFS failing is not
+    /// fatal for sequential exports (threads=1), which remain safe either way.
+    /// </summary>
+    private static void EnsureConcurrentReaders()
+    {
+        try
+        {
+            foreach (var vfs in _provider!.MountedVfs)
+            {
+                try { vfs.IsConcurrent = true; }
+                catch { /* older builds without the flag — reads stay shared */ }
+            }
+        }
+        catch { /* best effort — only matters for multi-worker exports */ }
+    }
+
     private static void EnsureProvider()
     {
         if (_provider == null)
             throw new InvalidOperationException("Not initialized. Send 'init' command first.");
+    }
+
+    // ─── Throttled progress ───────────────────────────────────────────
+    /// <summary>
+    /// Per-handler progress pacing. Emits on the 0th and final asset, every
+    /// 10th asset (the historical folder-export cadence), or whenever at
+    /// least <see cref="TimeFloorMs"/> has passed — whichever comes first.
+    /// Parallel workers call this concurrently; the rate-limiter keeps the
+    /// per-message stdout + Python dispatch cost constant instead of
+    /// multiplying with worker count.
+    /// </summary>
+    private sealed class ProgressPacer
+    {
+        public const int TimeFloorMs = 150;
+        private object _lock = new();
+        private long _lastEmitMs = long.MinValue; // forces an early first emit
+
+        public void Emit(int done, int total, string message)
+        {
+            if (done <= 0 || done >= total)
+            {
+                Respond(new { type = "progress", current = done, total, message });
+                return;
+            }
+            if (done % 10 == 0)
+            {
+                lock (_lock) _lastEmitMs = Environment.TickCount64;
+                Respond(new { type = "progress", current = done, total, message });
+                return;
+            }
+            var now = Environment.TickCount64;
+            lock (_lock)
+            {
+                if (now - _lastEmitMs < TimeFloorMs) return;
+                _lastEmitMs = now;
+            }
+            Respond(new { type = "progress", current = done, total, message });
+        }
     }
 
     private static void Respond(object obj)

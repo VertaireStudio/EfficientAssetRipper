@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QMenu, QTreeWidgetItem
 from core.type_cache import TypeCache
 from gui.unpacker_panel import UnpackerPanel
 
+import config
+
 pytestmark = pytest.mark.qt
 
 
@@ -308,7 +310,7 @@ def test_on_export_done_extension_swap_fallback(qtbot, tmp_path: Path):
 # _kick_temp_export
 # ---------------------------------------------------------------------------
 
-def test_kick_temp_export_builds_correct_formats_dict(qtbot, tmp_path: Path, monkeypatch):
+def test_kick_temp_export_builds_correct_formats_dict(qtbot, tmp_path: Path, mock_qsettings, monkeypatch):
     p = UnpackerPanel()
     qtbot.addWidget(p)
     p._mesh_preview_temp_dir = tmp_path
@@ -316,11 +318,15 @@ def test_kick_temp_export_builds_correct_formats_dict(qtbot, tmp_path: Path, mon
 
     captured: dict = {}
 
-    def fake_export(paths, output_dir, formats=None, texture_format="png", audio_format="wav"):
+    def fake_export(paths, output_dir, formats=None, texture_format="png", audio_format="wav",
+                    mesh_format="psk", webp_mode="lossless", webp_quality=90,
+                    threads=None, gpu=None,
+                    memory_limit_percent=0, physical_only=False):
         captured.update({
             "paths": paths,
             "output_dir": output_dir,
             "formats": formats,
+            "mesh_format": mesh_format,
         })
 
     monkeypatch.setattr(p._unpacker, "export", fake_export)
@@ -333,6 +339,10 @@ def test_kick_temp_export_builds_correct_formats_dict(qtbot, tmp_path: Path, mon
         "mesh": True, "texture": False, "props": False,
         "animation": False, "audio": False, "video": False,
     }
+    # Mesh format pass-through: config stores psk/glb/fbx, the CLI gets
+    # psk/gltf (fbx exports psk here and converts afterwards).
+    assert captured["mesh_format"] == {"psk": "psk", "glb": "gltf", "fbx": "psk"}.get(
+        (config.get("export_mesh_format") or "psk").lower(), "psk")
     assert p._pending_temp_preview is not None
     expected_path, kind, vfs_path = p._pending_temp_preview
     assert kind == "mesh"

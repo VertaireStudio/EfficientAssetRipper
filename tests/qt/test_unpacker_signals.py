@@ -524,3 +524,300 @@ def test_fmod_scan_result_signal(unpacker_with_stub, qtbot):
     result = sig.args[0]
     assert result["found"] is True
     assert result["banks"][0]["streams"][0]["name"] == "jump"
+
+
+# ---------------------------------------------------------------------------
+# Multithreaded export — "threads" field rides both export commands
+# ---------------------------------------------------------------------------
+
+def test_export_command_includes_threads_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export(["/Game/A.uasset"], "C:/out", threads=4)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["cmd"] == "export"
+    assert payload["threads"] == 4
+
+
+def test_export_command_omits_threads_when_auto(unpacker_with_stub):
+    """None means CLI-side auto sizing — the field must not be sent as 0"""
+    up, proc = unpacker_with_stub
+    up.export(["/Game/A.uasset"], "C:/out", threads=None)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "threads" not in payload
+
+
+def test_export_folder_command_includes_threads_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_folder("/Game/Foo", "C:/out", threads=8)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["cmd"] == "export_folder"
+    assert payload["threads"] == 8
+
+
+def test_export_folder_command_omits_threads_when_auto(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_folder("/Game/Foo", "C:/out", threads=None)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "threads" not in payload
+
+
+def test_wwise_audio_command_includes_threads_when_set(unpacker_with_stub):
+    """Parallel WWise export reuses the export worker count."""
+    up, proc = unpacker_with_stub
+    up.export_wwise_audio([{"wem_vfs_path": "/G/A.wem", "target_name": "A"}],
+                          "C:/out", threads=4)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["cmd"] == "export_wwise_audio"
+    assert payload["threads"] == 4
+
+
+def test_wwise_audio_command_omits_threads_when_auto(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_wwise_audio([{"wem_vfs_path": "/G/A.wem", "target_name": "A"}],
+                          "C:/out", threads=None)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "threads" not in payload
+
+
+def test_wwise_audio_command_ignores_non_positive_threads(unpacker_with_stub):
+    """0/negative must not ride along — CLI treats 0 as auto anyway, and the
+    parent sends None for auto, so a stray 0 is a caller bug we filter."""
+    up, proc = unpacker_with_stub
+    up.export_wwise_audio([{"wem_vfs_path": "/G/A.wem", "target_name": "A"}],
+                          "C:/out", threads=0)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "threads" not in payload
+
+
+def test_fmod_audio_command_includes_threads_when_set(unpacker_with_stub):
+    """Parallel FMOD subsong export reuses the export worker count."""
+    up, proc = unpacker_with_stub
+    up.export_fmod_audio([{"bank_vfs_path": "Game/B.bank", "stream_index": 1,
+                           "target_name": "jump"}], "C:/out", threads=4)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["cmd"] == "export_fmod_audio"
+    assert payload["threads"] == 4
+
+
+def test_fmod_audio_command_omits_threads_when_auto(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_fmod_audio([{"bank_vfs_path": "Game/B.bank", "stream_index": 1,
+                           "target_name": "jump"}], "C:/out", threads=None)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "threads" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Export formats — mesh_format / webp options ride the export commands
+# ---------------------------------------------------------------------------
+
+def test_export_command_carries_mesh_and_webp_options(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export(["/Game/A.uasset"], "C:/out", mesh_format="gltf",
+              webp_mode="lossy", webp_quality=85)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["mesh_format"] == "gltf"
+    assert payload["webp_mode"] == "lossy"
+    assert payload["webp_quality"] == 85
+
+
+def test_export_folder_command_carries_mesh_and_webp_options(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_folder("/Game/Foo", "C:/out", mesh_format="psk",
+                     webp_mode="lossless", webp_quality=100)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["mesh_format"] == "psk"
+    assert payload["webp_mode"] == "lossless"
+    assert payload["webp_quality"] == 100
+
+
+def test_wwise_command_carries_audio_format_choice(unpacker_with_stub):
+    """mp3/webm targets ride export_wwise_audio like wav/ogg always did."""
+    up, proc = unpacker_with_stub
+    up.export_wwise_audio([{"wem_vfs_path": "/G/A.wem", "target_name": "A"}],
+                          "C:/out", audio_format="webm")
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["audio_format"] == "webm"
+
+
+# ---------------------------------------------------------------------------
+# Memory policy — rides the export commands only when active
+# ---------------------------------------------------------------------------
+
+def test_export_command_carries_memory_policy_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export(["/Game/A.uasset"], "C:/out",
+              memory_limit_percent=60, physical_only=True)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["memory_limit_percent"] == 60
+    assert payload["physical_only"] is True
+
+
+def test_export_command_omits_memory_policy_when_unset(unpacker_with_stub):
+    """Defaults (0 / False) follow the threads/gpu convention — no fields."""
+    up, proc = unpacker_with_stub
+    up.export(["/Game/A.uasset"], "C:/out")
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "memory_limit_percent" not in payload
+    assert "physical_only" not in payload
+
+
+def test_export_command_omits_zero_percent_without_physical(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export(["/Game/A.uasset"], "C:/out", memory_limit_percent=0,
+              physical_only=False)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "memory_limit_percent" not in payload
+
+
+def test_export_folder_command_carries_memory_policy_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_folder("/Game/Foo", "C:/out",
+                     memory_limit_percent=40, physical_only=True)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["cmd"] == "export_folder"
+    assert payload["memory_limit_percent"] == 40
+    assert payload["physical_only"] is True
+
+
+def test_export_folder_command_omits_memory_policy_when_unset(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_folder("/Game/Foo", "C:/out")
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "memory_limit_percent" not in payload
+    assert "physical_only" not in payload
+
+
+def test_wwise_audio_command_carries_memory_policy_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_wwise_audio([{"wem_vfs_path": "/G/A.wem", "target_name": "A"}],
+                          "C:/out", memory_limit_percent=50, physical_only=False)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["memory_limit_percent"] == 50
+    assert "physical_only" not in payload
+
+
+def test_fmod_audio_command_carries_memory_policy_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_fmod_audio([{"bank_vfs_path": "Game/B.bank", "stream_index": 1,
+                           "target_name": "jump"}], "C:/out",
+                         memory_limit_percent=30, physical_only=True)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["memory_limit_percent"] == 30
+    assert payload["physical_only"] is True
+
+
+def test_video_command_carries_memory_policy_when_set(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_video([{"vfs_path": "/G/V.bk2", "kind": "raw_video"}], "C:/out",
+                    memory_limit_percent=80, physical_only=True)
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert payload["cmd"] == "export_video"
+    assert payload["memory_limit_percent"] == 80
+    assert payload["physical_only"] is True
+
+
+def test_video_command_omits_memory_policy_when_unset(unpacker_with_stub):
+    up, proc = unpacker_with_stub
+    up.export_video([{"vfs_path": "/G/V.bk2", "kind": "raw_video"}], "C:/out")
+    payload = json.loads(proc.write_log[0].decode("utf-8").strip())
+    assert "memory_limit_percent" not in payload
+    assert "physical_only" not in payload
+
+
+# ---------------------------------------------------------------------------
+# CLI "info" messages (e.g. the mount-time memory policy) dispatch cleanly
+# ---------------------------------------------------------------------------
+
+def test_info_message_dispatches_to_info_signal(unpacker_with_stub, qtbot):
+    up, proc = unpacker_with_stub
+    with qtbot.waitSignal(up.info, timeout=1000) as sig:
+        proc.feed(json.dumps({"type": "info", "message": "Memory limit active: 4.0 GB"}))
+    assert sig.args == ["Memory limit active: 4.0 GB"]
+
+
+def test_info_message_without_field_emits_empty_string(unpacker_with_stub, qtbot):
+    up, proc = unpacker_with_stub
+    with qtbot.waitSignal(up.info, timeout=1000) as sig:
+        proc.feed(json.dumps({"type": "info"}))
+    assert sig.args == [""]
+
+
+# ---------------------------------------------------------------------------
+# start() — env overrides (DOTNET_gcServer) + started_gc_mode bookkeeping
+# ---------------------------------------------------------------------------
+
+class FakeLaunchProcess(QObject):
+    """Minimal QProcess stand-in for exercising UnpackerProcess.start()."""
+    readyReadStandardOutput = Signal()
+    readyReadStandardError = Signal()
+    finished = Signal(int, QProcess.ExitStatus)
+    errorOccurred = Signal(QProcess.ProcessError)
+
+    # Enum namespaces UnpackerProcess.start() reads off the class itself.
+    ProcessState = QProcess.ProcessState
+    ProcessChannelMode = QProcess.ProcessChannelMode
+    ProcessError = QProcess.ProcessError
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.env = None
+        self.started = False
+
+    def setProgram(self, *_): pass
+
+    def setProcessChannelMode(self, *_): pass
+
+    def setProcessEnvironment(self, env):
+        self.env = env
+
+    def start(self):
+        self.started = True
+
+    def waitForStarted(self, _timeout=0):
+        return True
+
+    def state(self):
+        return QProcess.ProcessState.NotRunning
+
+
+def _launch_with(monkeypatch, qtbot, tmp_path, env_overrides):
+    import core.unpacker as unpacker_mod
+
+    exe = tmp_path / "CUE4ParseCLI"
+    exe.write_bytes(b"")
+    fake = FakeLaunchProcess()
+    factory = lambda parent=None, **kw: fake
+    # start() also reads enum namespaces off the class itself.
+    factory.ProcessState = QProcess.ProcessState
+    factory.ProcessChannelMode = QProcess.ProcessChannelMode
+    factory.ProcessError = QProcess.ProcessError
+    monkeypatch.setattr(unpacker_mod, "QProcess", factory)
+    up = UnpackerProcess()
+    ok = up.start(str(exe), env_overrides=env_overrides)
+    return up, fake, ok
+
+
+def test_start_with_workstation_override(qtbot, monkeypatch, tmp_path):
+    up, fake, ok = _launch_with(monkeypatch, qtbot, tmp_path,
+                                {"DOTNET_gcServer": "0"})
+    assert ok is True
+    assert fake.started is True
+    assert up.started_gc_mode == "workstation"
+    assert fake.env is not None
+    assert fake.env.value("DOTNET_gcServer") == "0"
+
+
+def test_start_default_gc_mode_is_server(qtbot, monkeypatch, tmp_path):
+    up, _fake, ok = _launch_with(monkeypatch, qtbot, tmp_path, None)
+    assert ok is True
+    assert up.started_gc_mode == "server"
+
+
+def test_missing_cli_reports_error(qtbot, monkeypatch, tmp_path):
+    """A nonexistent exe path must emit `error` and return False."""
+    up = UnpackerProcess()
+    errors = []
+    up.error.connect(errors.append)
+    assert up.start(str(tmp_path / "nope")) is False
+    assert errors and "not found" in errors[0]

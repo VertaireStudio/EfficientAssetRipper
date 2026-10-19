@@ -61,7 +61,21 @@ def test_rejects_relative_output_path(tmp_path):
 def test_rejects_non_blend_output(tmp_path):
     m = _ok_manifest(tmp_path)
     m["output_path"] = str(tmp_path / "out.txt")
-    with pytest.raises(ManifestValidationError, match=r"\.blend"):
+    with pytest.raises(ManifestValidationError, match=r"\.blend or \.fbx"):
+        _validate_manifest(m)
+
+
+def test_accepts_fbx_output_path(tmp_path):
+    """Mesh format "fbx" manifests convert into .fbx — accepted output."""
+    m = _ok_manifest(tmp_path)
+    m["output_path"] = str(tmp_path / "out.fbx")
+    _validate_manifest(m)
+
+
+def test_rejects_blender_native_output_ext_typos(tmp_path):
+    m = _ok_manifest(tmp_path)
+    m["output_path"] = str(tmp_path / "out.gltf")
+    with pytest.raises(ManifestValidationError, match=r"\.blend or \.fbx"):
         _validate_manifest(m)
 
 

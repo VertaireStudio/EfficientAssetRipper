@@ -97,8 +97,13 @@ def _validate_manifest(m: dict):
 
     if not os.path.isabs(output_path):
         _bail(f"Manifest output_path must be absolute: {output_path}")
-    if os.path.splitext(output_path)[1].lower() != ".blend":
-        _bail(f"Manifest output_path must end in .blend: {output_path}")
+    # ".blend" = the standard processing output; ".fbx" = the FBX export
+    # path (mesh format "fbx"). Anything else is a typo/adversarial path.
+    out_ext = os.path.splitext(output_path)[1].lower()
+    if out_ext not in (".blend", ".fbx"):
+        _bail(
+            f"Manifest output_path must end in .blend or .fbx: {output_path}"
+        )
 
     if outputs_root:
         norm_root = os.path.normpath(outputs_root)
@@ -152,6 +157,7 @@ from material_setup import setup_material_textures  # noqa: E402
 def main():
     psk_path = manifest["psk_path"]
     output_path = manifest["output_path"]
+    output_ext = os.path.splitext(output_path)[1].lower()  # ".blend" | ".fbx"
     addon_name = manifest.get("addon_name", "bl_ext.blender_org.io_scene_psk_psa")
     materials_spec = manifest.get("materials", {})
 
@@ -204,7 +210,15 @@ def main():
     processed_materials = 0
     failed_materials = 0
 
-    for obj in bpy.data.objects:
+    # Geometry-only FBX exports carry no material manifest — skip the wiring
+    # loop entirely instead of warning once per imported material about specs
+    # that were never meant to exist. (The empty iterable short-circuits the
+    # loop below; everything else stays as the .blend path expects.)
+    skip_material_wiring = output_ext == ".fbx" and not materials_spec
+    if skip_material_wiring:
+        status_msg("progress", step="materials_skipped")
+
+    for obj in [] if skip_material_wiring else bpy.data.objects:
         if obj.type != "MESH":
             continue
 
@@ -260,19 +274,23 @@ def main():
                 traceback.print_exc()
 
     # 5. Remove armature, keep mesh, clean up names
-    for obj in list(bpy.data.objects):
-        if obj.type == "ARMATURE":
-            # Capture each child's world matrix before clearing the parent so
-            # the visual transform survives the unparent.  Reading
-            # `child.matrix_world` after `parent = None` would give the new
-            # local matrix, not the world one we wanted to preserve.
-            for child in list(obj.children):
-                world = child.matrix_world.copy()
-                child.parent = None
-                child.matrix_world = world
-            bpy.data.objects.remove(obj, do_unlink=True)
-    for arm in list(bpy.data.armatures):
-        bpy.data.armatures.remove(arm)
+    # .blend output strips the armature deliberately (the .blend viewer flow
+    # only wants the mesh); FBX output must keep it so the rig/skin weights
+    # survive the export.
+    if output_ext == ".blend":
+        for obj in list(bpy.data.objects):
+            if obj.type == "ARMATURE":
+                # Capture each child's world matrix before clearing the parent so
+                # the visual transform survives the unparent.  Reading
+                # `child.matrix_world` after `parent = None` would give the new
+                # local matrix, not the world one we wanted to preserve.
+                for child in list(obj.children):
+                    world = child.matrix_world.copy()
+                    child.parent = None
+                    child.matrix_world = world
+                bpy.data.objects.remove(obj, do_unlink=True)
+        for arm in list(bpy.data.armatures):
+            bpy.data.armatures.remove(arm)
 
     # Strip trailing .001 / .002 etc. from object and mesh names
     for obj in bpy.data.objects:
@@ -314,30 +332,69 @@ def main():
     # 7. Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # 8. Save .blend atomically — write to .tmp, replace on success.
-    tmp_output = output_path + ".tmp"
-    try:
-        bpy.ops.wm.save_as_mainfile(filepath=tmp_output)
+    # 8. Save .blend atomically / export .fbx atomically — write to .tmp,
+    # replace on success.
+    if output_ext == ".fbx":
+        tmp_output = output_path + ".tmp"
         try:
-            tmp_size = os.path.getsize(tmp_output)
-        except OSError:
-            tmp_size = 0
-        if tmp_size <= 0:
+            bpy.ops.export_scene.fbx(
+                filepath=tmp_output,
+                # Whole scene: armature + skinned mesh, nothing selected.
+                use_selection=False,
+                object_types={"ARMATURE", "MESH"},
+                # PSK imports carry no action data; baking just slows the
+                # export and bakes nothing useful.
+                bake_anim=False,
+                add_leaf_bones=False,
+                # Geometry-only by design: texture files are not inlined;
+                # material references still point at their image paths.
+                embed_textures=False,
+                path_mode="AUTO",
+            )
+            try:
+                tmp_size = os.path.getsize(tmp_output)
+            except OSError:
+                tmp_size = 0
+            if tmp_size <= 0:
+                try:
+                    os.unlink(tmp_output)
+                except OSError:
+                    pass
+                status_msg("error", message="Exported FBX was empty (0 bytes) — aborting")
+                sys.exit(1)
+            os.replace(tmp_output, output_path)
+            status_msg("progress", step="saved")
+        except Exception as e:
             try:
                 os.unlink(tmp_output)
             except OSError:
                 pass
-            status_msg("error", message="Saved .blend was empty (0 bytes) — aborting")
+            status_msg("error", message=f"Failed to export FBX: {e}")
             sys.exit(1)
-        os.replace(tmp_output, output_path)
-        status_msg("progress", step="saved")
-    except Exception as e:
+    else:
+        tmp_output = output_path + ".tmp"
         try:
-            os.unlink(tmp_output)
-        except OSError:
-            pass
-        status_msg("error", message=f"Failed to save: {e}")
-        sys.exit(1)
+            bpy.ops.wm.save_as_mainfile(filepath=tmp_output)
+            try:
+                tmp_size = os.path.getsize(tmp_output)
+            except OSError:
+                tmp_size = 0
+            if tmp_size <= 0:
+                try:
+                    os.unlink(tmp_output)
+                except OSError:
+                    pass
+                status_msg("error", message="Saved .blend was empty (0 bytes) — aborting")
+                sys.exit(1)
+            os.replace(tmp_output, output_path)
+            status_msg("progress", step="saved")
+        except Exception as e:
+            try:
+                os.unlink(tmp_output)
+            except OSError:
+                pass
+            status_msg("error", message=f"Failed to save: {e}")
+            sys.exit(1)
 
     status_msg(
         "completed",

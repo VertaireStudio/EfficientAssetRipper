@@ -206,14 +206,21 @@ def test_try_audio_preview_fmod_uses_cached_temp_file(panel, tmp_path, qtbot):
 
 
 def test_export_done_chains_pending_fmod_export(panel, monkeypatch):
-    sent: list[tuple[list, str]] = []
+    calls: list[dict] = []
     monkeypatch.setattr(panel._unpacker, "export_fmod_audio",
-                        lambda entries, out_dir: sent.append((entries, out_dir)))
+                        lambda entries, out_dir, **kw: calls.append(
+                            {"entries": entries, "out_dir": out_dir, **kw}))
     entries = [{"bank_vfs_path": "B.bank", "stream_index": 1,
                 "target_name": "0001_x", "target_folder": "B"}]
     panel._pending_fmod_export = (entries, "C:/out")
     panel._on_export_done([], [])
-    assert sent == [(entries, "C:/out")]
+    assert len(calls) == 1
+    assert calls[0]["entries"] == entries
+    assert calls[0]["out_dir"] == "C:/out"
+    # The chained stage now passes threads=_export_threads(); the concrete
+    # value depends on QSettings state (None = CLI auto), only pinned in the
+    # dedicated threads tests.
+    assert "threads" in calls[0]
     assert panel._pending_fmod_export is None
 
 
@@ -223,7 +230,7 @@ def test_export_selected_expands_bank_row_to_all_streams(panel, monkeypatch, tmp
 
     sent: list[tuple[list, str]] = []
     monkeypatch.setattr(panel._unpacker, "export_fmod_audio",
-                        lambda entries, out_dir: sent.append((entries, out_dir)))
+                        lambda entries, out_dir, **kw: sent.append((entries, out_dir)))
 
     # Select the bank row itself (no audio_data) — should expand to streams.
     panel._on_browse_result("", [

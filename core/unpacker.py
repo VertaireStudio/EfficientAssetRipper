@@ -30,6 +30,8 @@ class UnpackerProcess(QObject):
 
     # Signals
     initialized = Signal(int, int, int, int, int, list)  # archive_count, unmounted_count, file_count, keys_submitted, loose_file_count, unmounted_archives
+    gpu_status = Signal(str, bool, str)       # device, available, reason — reported at init
+    info = Signal(str)                        # informational CLI message (e.g. memory policy)
     browse_result = Signal(str, list)         # path, list[dict{name, is_folder}]
     progress = Signal(int, int, str)          # current, total, message
     export_done = Signal(list, list, bool, int, int)  # succeeded, failed, cancelled, remaining, warning_count
@@ -51,13 +53,24 @@ class UnpackerProcess(QObject):
         super().__init__(parent)
         self._proc: Optional[QProcess] = None
         self._buffer = ""
+        # GC mode of the currently running CLI ("server" until launched with
+        # DOTNET_gcServer=0). Lets the panel detect a memory-settings drift
+        # and remount with the correct mode.
+        self.started_gc_mode = "server"
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self, cli_path: str) -> bool:
-        """Launch the CUE4ParseCLI subprocess."""
+    def start(self, cli_path: str, env_overrides: Optional[dict[str, str]] = None) -> bool:
+        """Launch the CUE4ParseCLI subprocess.
+
+        *env_overrides* vars are applied on top of the inherited environment
+        before the process starts. The GC type is read by the .NET runtime
+        (net9+: env vars take precedence over the app's runtimeconfig), so the
+        memory policy's "physical only" mode switches the CLI to workstation
+        GC via ``DOTNET_gcServer=0`` here — see UnpackerPanel._mount_archives.
+        """
         if self._proc is not None and self._proc.state() != QProcess.ProcessState.NotRunning:
             log.warning("CUE4ParseCLI already running")
             return True
@@ -70,6 +83,12 @@ class UnpackerProcess(QObject):
         self._proc = QProcess(self)
         self._proc.setProgram(str(exe))
         self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        if env_overrides:
+            from PySide6.QtCore import QProcessEnvironment
+            env = QProcessEnvironment.systemEnvironment()
+            for key, value in env_overrides.items():
+                env.insert(key, str(value))
+            self._proc.setProcessEnvironment(env)
         self._proc.readyReadStandardOutput.connect(self._on_stdout)
         self._proc.readyReadStandardError.connect(self._on_stderr)
         self._proc.finished.connect(self._on_finished)
@@ -91,7 +110,8 @@ class UnpackerProcess(QObject):
             return False
 
         self._buffer = ""
-        log.info("CUE4ParseCLI started: %s", cli_path)
+        self.started_gc_mode = "workstation" if (env_overrides or {}).get("DOTNET_gcServer") == "0" else "server"
+        log.info("CUE4ParseCLI started (%s GC): %s", self.started_gc_mode, cli_path)
         self.process_ready.emit()
         return True
 
@@ -113,15 +133,24 @@ class UnpackerProcess(QObject):
     # ------------------------------------------------------------------
 
     def initialize(self, game_dir: str, aes_keys: list[dict], ue_version: str = "GAME_UE5_4",
-                   mappings_path: str = "") -> None:
-        """Send init command to mount game archives."""
-        self._send({
+                   mappings_path: str = "", gpu: Optional[bool] = None) -> None:
+        """Send init command to mount game archives.
+
+        *gpu* (optional bool) enables/disables GPU texture decoding; when
+        None the CLI default (on, with per-texture CPU fallback) applies and
+        the CLI still probes/reports device availability via the
+        ``gpu_status`` NDJSON record.
+        """
+        out: dict = {
             "cmd": "init",
             "game_dir": game_dir,
             "aes_keys": aes_keys,
             "ue_version": ue_version,
             "mappings_path": mappings_path,
-        })
+        }
+        if gpu is not None:
+            out["gpu"] = bool(gpu)
+        self._send(out)
 
     def browse(self, vfs_path: str = "/") -> None:
         """Request directory listing at *vfs_path*."""
@@ -133,9 +162,23 @@ class UnpackerProcess(QObject):
 
     def export(self, asset_paths: list[str], output_dir: str,
                formats: Optional[dict[str, bool]] = None,
-               texture_format: str = "png", audio_format: str = "wav") -> None:
-        """Export specific assets."""
-        self._send({
+               texture_format: str = "png", audio_format: str = "wav",
+               mesh_format: str = "psk", webp_mode: str = "lossless",
+               webp_quality: int = 90,
+               threads: Optional[int] = None, gpu: Optional[bool] = None,
+               memory_limit_percent: int = 0, physical_only: bool = False) -> None:
+        """Export specific assets.
+
+        *gpu* (optional bool) enables/disables GPU texture decoding for this
+        export batch; None keeps the CLI default (on, CPU fallback).
+        *mesh_format* picks the mesh output ("psk" or "gltf"); *webp_mode* /
+        *webp_quality* apply only when *texture_format* is "webp".
+        *memory_limit_percent* (0 = unlimited, 10-95) caps the exporter at a
+        share of the RAM currently free; *physical_only* additionally enforces
+        that the working set stays inside physical memory (see Settings ·
+        Memory).
+        """
+        cmd: dict = {
             "cmd": "export",
             "paths": asset_paths,
             "output_dir": output_dir,
@@ -143,13 +186,36 @@ class UnpackerProcess(QObject):
                                    "animation": True, "audio": True, "video": True},
             "texture_format": texture_format,
             "audio_format": audio_format,
-        })
+            "mesh_format": mesh_format,
+            "webp_mode": webp_mode,
+            "webp_quality": webp_quality,
+        }
+        if threads is not None:
+            cmd["threads"] = threads
+        if gpu is not None:
+            cmd["gpu"] = bool(gpu)
+        self._append_memory_fields(cmd, memory_limit_percent, physical_only)
+        self._send(cmd)
 
     def export_folder(self, vfs_path: str, output_dir: str,
                       formats: Optional[dict[str, bool]] = None,
-                      texture_format: str = "png", audio_format: str = "wav") -> None:
-        """Export all assets under a VFS folder."""
-        self._send({
+                      texture_format: str = "png", audio_format: str = "wav",
+                      mesh_format: str = "psk", webp_mode: str = "lossless",
+                      webp_quality: int = 90,
+                      threads: Optional[int] = None, gpu: Optional[bool] = None,
+                      memory_limit_percent: int = 0, physical_only: bool = False) -> None:
+        """Export all assets under a VFS folder.
+
+        *gpu* (optional bool) enables/disables GPU texture decoding for this
+        export batch; None keeps the CLI default (on, CPU fallback).
+        *mesh_format* picks the mesh output ("psk" or "gltf"); *webp_mode* /
+        *webp_quality* apply only when *texture_format* is "webp".
+        *memory_limit_percent* (0 = unlimited, 10-95) caps the exporter at a
+        share of the RAM currently free; *physical_only* additionally enforces
+        that the working set stays inside physical memory (see Settings ·
+        Memory).
+        """
+        cmd: dict = {
             "cmd": "export_folder",
             "path": vfs_path,
             "output_dir": output_dir,
@@ -157,7 +223,27 @@ class UnpackerProcess(QObject):
                                    "animation": True, "audio": True, "video": True},
             "texture_format": texture_format,
             "audio_format": audio_format,
-        })
+            "mesh_format": mesh_format,
+            "webp_mode": webp_mode,
+            "webp_quality": webp_quality,
+        }
+        if threads is not None:
+            cmd["threads"] = threads
+        if gpu is not None:
+            cmd["gpu"] = bool(gpu)
+        self._append_memory_fields(cmd, memory_limit_percent, physical_only)
+        self._send(cmd)
+
+    @staticmethod
+    def _append_memory_fields(cmd: dict, memory_limit_percent: int,
+                              physical_only: bool) -> None:
+        """Add the memory-policy fields to an export command, but only when
+        active — unset policy follows the same "omit the field" convention as
+        ``threads``/``gpu`` so older CLIs see no behavior change."""
+        if memory_limit_percent and memory_limit_percent > 0:
+            cmd["memory_limit_percent"] = int(memory_limit_percent)
+        if physical_only:
+            cmd["physical_only"] = True
 
     def cancel(self) -> None:
         """Cancel the current export operation."""
@@ -175,17 +261,27 @@ class UnpackerProcess(QObject):
         """Scan FMOD .bank files (VFS + loose) for playable streams."""
         self._send({"cmd": "scan_fmod_banks"})
 
-    def export_fmod_audio(self, entries: list[dict], output_dir: str) -> None:
+    def export_fmod_audio(self, entries: list[dict], output_dir: str,
+                          threads: Optional[int] = None,
+                          memory_limit_percent: int = 0,
+                          physical_only: bool = False) -> None:
         """Export individual FMOD bank streams to WAV.
 
         Each entry carries ``bank_vfs_path``, ``stream_index`` (1-based,
         vgmstream subsong numbering), ``target_name`` and ``target_folder``.
+        *threads* (optional) sets the CLI worker count for the parallel
+        vgmstream conversions; None lets the CLI default run one worker per
+        core.
         """
-        self._send({
+        cmd: dict = {
             "cmd": "export_fmod_audio",
             "output_dir": output_dir,
             "entries": entries,
-        })
+        }
+        if threads is not None and threads > 0:
+            cmd["threads"] = int(threads)
+        self._append_memory_fields(cmd, memory_limit_percent, physical_only)
+        self._send(cmd)
 
     def scan_types(self) -> None:
         """Bulk-scan every package's export types for the type cache.
@@ -200,16 +296,30 @@ class UnpackerProcess(QObject):
         self._send({"cmd": "list_exports", "path": vfs_path})
 
     def export_wwise_audio(self, entries: list[dict], output_dir: str,
-                           audio_format: str = "wav") -> None:
-        """Export and convert WWise audio files with proper naming."""
-        self._send({
+                           audio_format: str = "wav",
+                           threads: Optional[int] = None,
+                           memory_limit_percent: int = 0,
+                           physical_only: bool = False) -> None:
+        """Export and convert WWise audio files with proper naming.
+
+        *threads* (optional) sets the CLI worker count for the parallel
+        extract-and-convert workers; None lets the CLI default run one
+        worker per core.
+        """
+        cmd: dict = {
             "cmd": "export_wwise_audio",
             "output_dir": output_dir,
             "audio_format": audio_format,
             "entries": entries,
-        })
+        }
+        if threads is not None and threads > 0:
+            cmd["threads"] = int(threads)
+        self._append_memory_fields(cmd, memory_limit_percent, physical_only)
+        self._send(cmd)
 
-    def export_video(self, entries: list[dict], output_dir: str) -> None:
+    def export_video(self, entries: list[dict], output_dir: str,
+                     memory_limit_percent: int = 0,
+                     physical_only: bool = False) -> None:
         """Export video assets — FileMediaSource UObjects or raw video leaves.
 
         Each entry must carry ``vfs_path`` plus a ``kind`` of either
@@ -218,11 +328,13 @@ class UnpackerProcess(QObject):
         replies with the same ``export_done`` payload other export commands
         produce.
         """
-        self._send({
+        cmd: dict = {
             "cmd": "export_video",
             "output_dir": output_dir,
             "entries": entries,
-        })
+        }
+        self._append_memory_fields(cmd, memory_limit_percent, physical_only)
+        self._send(cmd)
 
     # ------------------------------------------------------------------
     # IPC internals
@@ -298,6 +410,9 @@ class UnpackerProcess(QObject):
                 msg.get("unmounted_archives") or [],
             )
 
+        elif msg_type == "info":
+            self.info.emit(msg.get("message", ""))
+
         elif msg_type == "browse_result":
             self.browse_result.emit(
                 msg.get("path", ""),
@@ -354,6 +469,13 @@ class UnpackerProcess(QObject):
                     int(msg.get("error_count", 0)),
                     int(msg.get("total_packages", 0)),
                 )
+
+        elif msg_type == "gpu_status":
+            self.gpu_status.emit(
+                msg.get("device", ""),
+                bool(msg.get("available", False)),
+                msg.get("reason", "") or "",
+            )
 
         elif msg_type == "warning":
             self.warning.emit(msg.get("message", ""))

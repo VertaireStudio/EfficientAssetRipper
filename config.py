@@ -28,7 +28,28 @@ _DEFAULTS = {
     "aes_keys": "[]",
     "unpack_ue_version": "GAME_UE5_4",
     "export_texture_format": "png",
+    # WebP-only options: "lossless" (pixel-exact, default) or "lossy".
+    "export_texture_webp_mode": "lossless",
+    # Lossy WebP quality 1-100 (ignored in lossless mode).
+    "export_texture_webp_quality": 90,
     "export_audio_format": "wav",
+    # Mesh export format: psk | gltf | fbx. "gltf" is produced directly by the
+    # CUE4Parse CLI (.glb); "fbx" converts the exported PSK via Blender.
+    "export_mesh_format": "psk",
+    # Export worker threads for the CUE4Parse CLI. 0 = auto (one worker per CPU core).
+    "unpacker_export_threads": 0,
+    # Export memory policy (enforced inside the CUE4Parse CLI):
+    # - "unpacker_physical_memory_only": keep the exporter's working set inside
+    #   physical RAM (never rely on swap/page file). Also launches the CLI
+    #   with workstation GC — server GC's per-core heaps roughly double the
+    #   baseline footprint, which defeats the point of the cap.
+    # - "unpacker_memory_limit_percent": hard budget as a percentage of the
+    #   RAM currently free (1-95). 0 = unlimited.
+    "unpacker_physical_memory_only": False,
+    "unpacker_memory_limit_percent": 0,
+    # GPU texture decode mode for the CUE4Parse CLI: "auto" (use GPU when a
+    # Vulkan GPU device is present, CPU fallback otherwise), "on", or "off".
+    "unpacker_gpu_accel": "auto",
     "active_profile": "Default",
     "color_scheme": "Dusk",
     "custom_schemes": "{}",

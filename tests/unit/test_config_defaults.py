@@ -24,7 +24,14 @@ REQUIRED_KEYS = {
     "aes_keys",
     "unpack_ue_version",
     "export_texture_format",
+    "export_texture_webp_mode",
+    "export_texture_webp_quality",
     "export_audio_format",
+    "export_mesh_format",
+    "unpacker_export_threads",
+    "unpacker_gpu_accel",
+    "unpacker_physical_memory_only",
+    "unpacker_memory_limit_percent",
     "active_profile",
     "color_scheme",
     "custom_schemes",
@@ -42,7 +49,16 @@ def test_get_returns_default_when_unset(mock_qsettings):
     """An empty stub QSettings should fall back to the _DEFAULTS value."""
     assert config.get("psk_addon_name") == "bl_ext.blender_org.io_scene_psk_psa"
     assert config.get("export_texture_format") == "png"
+    assert config.get("export_texture_webp_mode") == "lossless"
+    assert config.get("export_mesh_format") == "psk"
     assert config.get("active_profile") == "Default"
+
+
+def test_memory_policy_defaults_are_off(mock_qsettings):
+    """The export memory policy ships disabled — no surprise caps."""
+    raw = config.get("unpacker_physical_memory_only")
+    assert raw in (False, "false", "False", "") or str(raw).lower() == "false"
+    assert config.get_int("unpacker_memory_limit_percent") == 0
 
 
 def test_get_returns_empty_string_for_unknown_key(mock_qsettings):
@@ -63,9 +79,19 @@ def test_get_int_round_trip(mock_qsettings):
     assert config.get_int("timeout_seconds") == 300
 
 
+def test_export_threads_default_is_auto(mock_qsettings):
+    """0 means CLI-side auto sizing (one worker per CPU core)."""
+    assert config.get_int("unpacker_export_threads") == 0
+
+
 def test_addon_name_default_is_current_value():
     """Guards against accidental rewrite of the default addon name."""
     assert config._DEFAULTS["psk_addon_name"] == "bl_ext.blender_org.io_scene_psk_psa"
+
+
+def test_gpu_accel_default_is_auto():
+    "GPU texture decode defaults to auto (use GPU when present, CPU fallback)."
+    assert config._DEFAULTS["unpacker_gpu_accel"] == "auto"
 
 
 def test_get_presets_path_returns_path_object(mock_qsettings):

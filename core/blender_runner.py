@@ -66,9 +66,13 @@ def _validate_manifest(manifest: dict) -> None:
         raise ManifestValidationError(
             f"output_path must be absolute: {output_path}"
         )
-    if os.path.splitext(output_path)[1].lower() != ".blend":
+    # ".blend" = the standard processing output; ".fbx" = the FBX export
+    # path (mesh format "fbx"): the script exports the imported rig instead
+    # of saving a .blend file. Anything else is a typo/adversarial path.
+    out_ext = os.path.splitext(output_path)[1].lower()
+    if out_ext not in (".blend", ".fbx"):
         raise ManifestValidationError(
-            f"output_path must end in .blend: {output_path}"
+            f"output_path must end in .blend or .fbx: {output_path}"
         )
 
     if outputs_root:

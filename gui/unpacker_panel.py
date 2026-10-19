@@ -76,6 +76,7 @@ class UnpackerPanel(QWidget):
     media_preview = Signal(str)         # local file path for Media Preview tab (audio or video — auto-routed by extension)
     tga_preview = Signal(str)           # local file path for TGA/image Preview tab
     mesh_preview = Signal(str)          # local .psk path for Mesh Preview tab
+    fbx_requested = Signal(list)        # newly exported .psk paths for FBX conversion
     version_mismatch = Signal(str)      # banner text for the log viewer
     aes_keys_required = Signal(int, list)   # (unmounted_count, [{"name", "guid"}, ...]) — host opens prompt dialog
 
@@ -567,9 +568,11 @@ class UnpackerPanel(QWidget):
         self._unpacker.types_scan_batch.connect(self._on_types_scan_batch)
         self._unpacker.types_scan_done.connect(self._on_types_scan_done)
         self._unpacker.warning.connect(self._on_warning)
+        self._unpacker.gpu_status.connect(self._on_gpu_status)
         self._unpacker.version_warning.connect(self._on_version_warning)
         self._unpacker.version_detected.connect(self._on_version_detected)
         self._unpacker.error.connect(self._on_error)
+        self._unpacker.info.connect(self._on_cli_info)
         self._unpacker.process_ended.connect(self._on_process_ended)
 
     # ------------------------------------------------------------------
@@ -859,8 +862,21 @@ class UnpackerPanel(QWidget):
         # Clear any prior version-mismatch banner — re-mount re-arms detection.
         self.version_mismatch.emit("")
 
+        physical_only = self._physical_only_enabled()
+        desired_gc = "workstation" if physical_only else "server"
+        if self._unpacker.is_running and self._unpacker.started_gc_mode != desired_gc:
+            # The .NET GC type is startup-only (env vars beat runtimeconfig on
+            # net9+). A running CLI launched before the setting flipped must
+            # be relaunched — a re-mount follows anyway.
+            log.info(
+                "Restarting CUE4ParseCLI for GC mode %s (previously %s)",
+                desired_gc, self._unpacker.started_gc_mode,
+            )
+            self._unpacker.stop()
+
         if not self._unpacker.is_running:
-            if not self._unpacker.start(cli_path):
+            overrides = {"DOTNET_gcServer": "0"} if physical_only else None
+            if not self._unpacker.start(cli_path, env_overrides=overrides):
                 self._mount_btn.setEnabled(True)
                 self._status_label.setText("Failed to start CLI")
                 self._progress.setMaximum(1)
@@ -868,7 +884,8 @@ class UnpackerPanel(QWidget):
 
         aes_keys = self._get_aes_keys()
         mappings = self._mappings_edit.text().strip()
-        self._unpacker.initialize(game_dir, aes_keys, ue_version, mappings)
+        self._unpacker.initialize(game_dir, aes_keys, ue_version, mappings,
+                                  gpu=self._gpu_flag())
 
     @Slot(int, int, int, int, int, list)
     def _on_initialized(self, archive_count: int, unmounted_count: int,
@@ -1526,6 +1543,12 @@ class UnpackerPanel(QWidget):
             audio_format = config.get("export_audio_format") or "wav"
             return (f".{audio_format}", ".wav", ".ogg")
         if kind == "mesh":
+            mesh_format = (config.get("export_mesh_format") or "psk").lower()
+            if mesh_format == "glb":
+                # psk fallbacks cover a batch that was changed mid-flight.
+                return (".glb", ".psk", ".pskx")
+            if mesh_format == "fbx":
+                return (".fbx", ".psk", ".pskx")
             return (".psk", ".pskx")
         if kind == "texture":
             tex_format = config.get("export_texture_format") or "png"
@@ -1587,10 +1610,18 @@ class UnpackerPanel(QWidget):
         name = vfs_path.rsplit("/", 1)[-1] or vfs_path
         self._status_label.setText(f"Exporting for preview: {name}")
         self._begin_export()
+        mem_pct, phys_only = self._memory_policy()
         self._unpacker.export(
             [vfs_path], str(temp_dir), formats=formats,
             texture_format=config.get("export_texture_format") or "png",
             audio_format=config.get("export_audio_format") or "wav",
+            mesh_format=self._cli_mesh_format(),
+            webp_mode=self._webp_settings()[0],
+            webp_quality=self._webp_settings()[1],
+            threads=self._export_threads(),
+            gpu=self._gpu_flag(),
+            memory_limit_percent=mem_pct,
+            physical_only=phys_only,
         )
 
     def _preview_audio_vfs(self, vfs_path: str):
@@ -1655,8 +1686,11 @@ class UnpackerPanel(QWidget):
 
         self._status_label.setText(f"Exporting for preview: {name}")
         self._begin_export()
+        mem_pct, phys_only = self._memory_policy()
         self._unpacker.export_video(
             [{"vfs_path": vfs_path, "kind": leaf_kind}], str(temp_dir),
+            memory_limit_percent=mem_pct,
+            physical_only=phys_only,
         )
 
     def _preview_mesh_vfs(self, vfs_path: str):
@@ -2037,6 +2071,7 @@ class UnpackerPanel(QWidget):
             return
 
         self._begin_export()
+        mem_pct, phys_only = self._memory_policy()
 
         # Chain: regular export first, then wwise, then fmod — each queued
         # stage is kicked off by _on_export_done when the previous completes.
@@ -2047,15 +2082,28 @@ class UnpackerPanel(QWidget):
                 self._pending_fmod_export = (fmod_entries, output_dir)
             self._unpacker.export(regular_paths, output_dir, self._get_formats(),
                                   texture_format=config.get("export_texture_format"),
-                                  audio_format=config.get("export_audio_format"))
+                                  audio_format=config.get("export_audio_format"),
+                                  mesh_format=self._cli_mesh_format(),
+                                  webp_mode=self._webp_settings()[0],
+                                  webp_quality=self._webp_settings()[1],
+                                  threads=self._export_threads(),
+                                  gpu=self._gpu_flag(),
+                                  memory_limit_percent=mem_pct,
+                                  physical_only=phys_only)
         elif wwise_entries:
             if fmod_entries:
                 self._pending_fmod_export = (fmod_entries, output_dir)
             self._unpacker.export_wwise_audio(
                 wwise_entries, output_dir,
-                audio_format=config.get("export_audio_format"))
+                audio_format=config.get("export_audio_format"),
+                threads=self._export_threads(),
+                memory_limit_percent=mem_pct,
+                physical_only=phys_only)
         else:
-            self._unpacker.export_fmod_audio(fmod_entries, output_dir)
+            self._unpacker.export_fmod_audio(fmod_entries, output_dir,
+                                             threads=self._export_threads(),
+                                             memory_limit_percent=mem_pct,
+                                             physical_only=phys_only)
 
     def _export_folder(self):
         selected = self._tree.selectedItems()
@@ -2130,7 +2178,72 @@ class UnpackerPanel(QWidget):
                 vfs_path, output_dir, self._get_formats(),
                 texture_format=config.get("export_texture_format"),
                 audio_format=config.get("export_audio_format"),
+                mesh_format=self._cli_mesh_format(),
+                webp_mode=self._webp_settings()[0],
+                webp_quality=self._webp_settings()[1],
+                threads=self._export_threads(),
+                gpu=self._gpu_flag(),
+                memory_limit_percent=self._memory_limit_percent(),
+                physical_only=self._physical_only_enabled(),
             )
+
+    def _cli_mesh_format(self) -> str:
+        """Mesh format token the CLI understands for this export batch.
+
+        Config stores the UI token: psk | glb | fbx. The CLI knows psk/gltf;
+        "fbx" exports PSK here and the Blender conversion chain in
+        _on_export_done turns those files into FBX afterwards.
+        """
+        return {"glb": "gltf", "fbx": "psk"}.get(
+            (config.get("export_mesh_format") or "psk").lower(), "psk")
+
+    def _webp_settings(self) -> tuple[str, int]:
+        """(webp_mode, webp_quality) CLI args from the Settings dialog."""
+        mode = (config.get("export_texture_webp_mode") or "lossless").lower()
+        if mode not in ("lossless", "lossy"):
+            mode = "lossless"
+        try:
+            quality = int(config.get("export_texture_webp_quality"))
+        except (TypeError, ValueError):
+            quality = 90
+        return (mode, max(1, min(100, quality)))
+
+    def _export_threads(self):
+        """Configured export worker count for the CLI; None = auto (all cores)."""
+        t = config.get_int("unpacker_export_threads")
+        return t if t > 0 else None
+
+    def _physical_only_enabled(self) -> bool:
+        """True when Settings armed "use only physical memory" mode."""
+        return config.get_raw("unpacker_physical_memory_only") in (
+            True, "true", "True", 1)
+
+    def _memory_limit_percent(self) -> int:
+        """Configured memory budget share of the RAM currently free; 0 = unlimited."""
+        try:
+            pct = int(config.get("unpacker_memory_limit_percent"))
+        except (TypeError, ValueError):
+            pct = 0
+        return max(0, min(95, pct))
+
+    def _memory_policy(self) -> tuple[int, bool]:
+        """(memory_limit_percent, physical_only) kwargs for export commands."""
+        return (self._memory_limit_percent(), self._physical_only_enabled())
+
+    def _on_cli_info(self, message: str):
+        """Informational CLI message (e.g. the mount-time memory policy)."""
+        if message:
+            self.log_message.emit(message, "info")
+
+    def _gpu_flag(self):
+        """GPU texture decode preference resolved for the CLI.
+
+        "auto"/"on" pass None and let the CLI try the GPU with per-texture
+        CPU fallback (auto-on when a suitable Vulkan device exists);
+        "off" passes False to force the CPU path.
+        """
+        mode = config.get("unpacker_gpu_accel")
+        return False if mode == "off" else None
 
     def _begin_export(self):
         self._exporting = True
@@ -2210,7 +2323,10 @@ class UnpackerPanel(QWidget):
             self._status_label.setText(f"Exporting {len(entries)} audio files...")
             self._unpacker.export_wwise_audio(
                 entries, out_dir,
-                audio_format=config.get("export_audio_format"))
+                audio_format=config.get("export_audio_format"),
+                threads=self._export_threads(),
+                memory_limit_percent=self._memory_limit_percent(),
+                physical_only=self._physical_only_enabled())
             return
 
         # Then any pending FMOD stream export (chained after wwise/regular)
@@ -2218,7 +2334,10 @@ class UnpackerPanel(QWidget):
             entries, out_dir = self._pending_fmod_export
             self._pending_fmod_export = None
             self._status_label.setText(f"Exporting {len(entries)} FMOD streams...")
-            self._unpacker.export_fmod_audio(entries, out_dir)
+            self._unpacker.export_fmod_audio(entries, out_dir,
+                                             threads=self._export_threads(),
+                                             memory_limit_percent=self._memory_limit_percent(),
+                                             physical_only=self._physical_only_enabled())
             return
 
         # Handle temp-export-for-preview (audio / mesh / texture)
@@ -2289,8 +2408,14 @@ class UnpackerPanel(QWidget):
         self._export_btn.setEnabled(True)
         self._export_folder_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
-        self._progress.setMaximum(len(succeeded) + len(failed))
-        self._progress.setValue(len(succeeded) + len(failed))
+        if cancelled:
+            # The user discarded this run — blank the bar instead of leaving
+            # it parked at the last partial value, which would read as real
+            # progress the next look at the panel.
+            self._progress.reset()
+        else:
+            self._progress.setMaximum(len(succeeded) + len(failed))
+            self._progress.setValue(len(succeeded) + len(failed))
 
         msg = f"Export complete: {len(succeeded)} succeeded, {len(failed)} failed"
         if cancelled:
@@ -2337,6 +2462,19 @@ class UnpackerPanel(QWidget):
             if count:
                 self._handoff_btn.setEnabled(True)
                 self._handoff_btn.setText(f"Send {count} PSKs to Queue →")
+
+            # FBX export mode: hand every PSK this export wrote to the Blender
+            # conversion chain. Only files from *this* batch are converted so
+            # re-running an FBX export doesn't redo the whole export folder,
+            # and a cancelled run converts nothing.
+            if ((config.get("export_mesh_format") or "psk").lower() == "fbx"
+                    and not cancelled):
+                psks = [p for p in new_psks if p.suffix.lower() in (".psk", ".pskx")]
+                if psks:
+                    self.fbx_requested.emit(psks)
+                    self.log_message.emit(
+                        f"FBX mode: converting {len(psks)} PSK file(s) via Blender",
+                        "info")
 
     # ------------------------------------------------------------------
     # Hand-off to Asset Browser
@@ -2446,6 +2584,18 @@ class UnpackerPanel(QWidget):
         box.exec()
         if chk.isChecked():
             self._suppress_export_error_popup = True
+
+    @Slot(str)
+    @Slot(str, bool, str)
+    def _on_gpu_status(self, device: str, available: bool, reason: str):
+        mode = config.get("unpacker_gpu_accel") or "auto"
+        if not available:
+            detail = reason or "no suitable GPU device"
+            self.log_message.emit(f"GPU texture decode: off — {detail}", "info")
+            return
+        suffix = "" if mode == "on" else " (auto)"
+        self.log_message.emit(
+            f"GPU texture decode: enabled{suffix} — {device}", "success")
 
     @Slot(str)
     def _on_warning(self, message: str):
