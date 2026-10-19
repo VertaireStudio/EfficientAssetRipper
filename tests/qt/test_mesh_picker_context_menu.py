@@ -1,4 +1,4 @@
-"""Tests for the PSK Picker's right-click context menu."""
+"""Tests for the Mesh Picker's right-click context menu."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QMenu, QTreeWidgetItem
 
-from gui.psk_picker import PskPickerPanel
+from gui.mesh_picker import MeshPickerPanel
 
 pytestmark = pytest.mark.qt
 
@@ -24,7 +24,7 @@ _EXPAND_ACTION_LABELS = {
 }
 
 
-def _capture_menu_actions(panel: PskPickerPanel, item: QTreeWidgetItem) -> list[str]:
+def _capture_menu_actions(panel: MeshPickerPanel, item: QTreeWidgetItem) -> list[str]:
     """Drive `_popup_context_menu` and return the picker-specific action labels.
 
     Filters out the shared Expand/Collapse helper entries so existing
@@ -56,7 +56,7 @@ def _capture_menu_actions(panel: PskPickerPanel, item: QTreeWidgetItem) -> list[
     return captured[0] if captured else []
 
 
-def _seed_picker(panel: PskPickerPanel, paths: list[Path]) -> list[QTreeWidgetItem]:
+def _seed_picker(panel: MeshPickerPanel, paths: list[Path]) -> list[QTreeWidgetItem]:
     """Populate the picker with given paths and return the leaf tree items."""
     panel._all_paths = list(paths)
     panel._categories = [("TestCat", "TestSub") for _ in paths]
@@ -73,7 +73,7 @@ def _seed_picker(panel: PskPickerPanel, paths: list[Path]) -> list[QTreeWidgetIt
 
 
 def test_menu_for_leaf_offers_preview_and_reveal(qtbot, tmp_path: Path):
-    panel = PskPickerPanel()
+    panel = MeshPickerPanel()
     qtbot.addWidget(panel)
     psk = tmp_path / "Mesh.psk"
     psk.write_bytes(b"")
@@ -81,13 +81,13 @@ def test_menu_for_leaf_offers_preview_and_reveal(qtbot, tmp_path: Path):
     assert leaves, "expected at least one leaf item after rebuild"
 
     actions = _capture_menu_actions(panel, leaves[0])
-    assert actions == ["Preview Mesh", "Open containing folder"]
+    assert actions == ["Preview Mesh (PSK)", "Open containing folder"]
 
 
 def test_menu_skipped_for_category_header(qtbot, tmp_path: Path):
     """Category/subcategory headers aren't in `_item_to_idx`; the menu builder
     bails before any QMenu actions are added."""
-    panel = PskPickerPanel()
+    panel = MeshPickerPanel()
     qtbot.addWidget(panel)
     psk = tmp_path / "Mesh.psk"
     psk.write_bytes(b"")
@@ -99,7 +99,7 @@ def test_menu_skipped_for_category_header(qtbot, tmp_path: Path):
 
 
 def test_preview_action_emits_signal_with_psk_path(qtbot, tmp_path: Path):
-    panel = PskPickerPanel()
+    panel = MeshPickerPanel()
     qtbot.addWidget(panel)
     psk = tmp_path / "Mesh.psk"
     psk.write_bytes(b"")
@@ -119,7 +119,9 @@ def test_preview_action_emits_signal_with_psk_path(qtbot, tmp_path: Path):
         with qtbot.waitSignal(panel.mesh_preview_requested, timeout=2000) as blocker:
             panel._popup_context_menu(leaves[0], QPoint(0, 0))
             menu = captured[0]
-            preview_action = next(a for a in menu.actions() if a.text() == "Preview Mesh")
+            preview_action = next(
+                a for a in menu.actions() if a.text().startswith("Preview Mesh")
+            )
             preview_action.trigger()
     finally:
         QMenu.__init__ = orig_init  # type: ignore[assignment]
@@ -128,7 +130,7 @@ def test_preview_action_emits_signal_with_psk_path(qtbot, tmp_path: Path):
 
 
 def test_reveal_action_opens_parent_folder_via_qdesktopservices(qtbot, tmp_path: Path):
-    panel = PskPickerPanel()
+    panel = MeshPickerPanel()
     qtbot.addWidget(panel)
     psk = tmp_path / "sub" / "Mesh.psk"
     psk.parent.mkdir(parents=True, exist_ok=True)

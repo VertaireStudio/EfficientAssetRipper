@@ -259,10 +259,12 @@ internal static class Program
     /// <see cref="MaxConcurrentSerializeThreads"/> so N parallel export workers
     /// can each hold one serialization thread without tripping the cap. Each
     /// request waits up to <paramref name="timeoutMs"/> for a completion;
-    /// on timeout the item is orphaned (the action keeps running to
-    /// completion on its worker — results are discarded), a warning is
-    /// emitted and null is returned. capturedError is populated if the action
-    /// threw before completing.
+    /// on timeout the item is marked abandoned: queued-but-not-started work is
+    /// skipped entirely (the caller's package closure is freed instead of
+    /// allocated for a discarded result) while work already running on its
+    /// worker keeps running to completion — native decodes have no safe point
+    /// to resume from. A warning is emitted and null is returned.
+    /// capturedError is populated if the action threw before completing.
     /// </summary>
     private static T? RunOnBoundedThread<T>(Func<T> action, int timeoutMs, out Exception? capturedError) where T : class
     {
@@ -272,9 +274,14 @@ internal static class Program
 
         if (!work.Completion.Task.Wait(timeoutMs))
         {
-            // The action keeps running on its orphaned worker; we just stop
-            // waiting for it. The pool (worker count) still bounds concurrent
-            // 4 MB stacks, so saturation degrades to waiting, never to growth.
+            // Mark abandoned so the queue drops this item: if it hasn't been
+            // picked up by a worker yet the action never runs and the package
+            // closure captured in `action` frees with the caller's stack —
+            // previously it stayed alive until a worker executed it to
+            // completion for a result nobody would read. The pool (worker
+            // count) still bounds concurrent 4 MB stacks, so saturation
+            // degrades to waiting, never to growth.
+            work.Abandoned = true;
             Respond(new { type = "warning", message = $"Serialize worker pool saturated; skipped serialization after {timeoutMs} ms" });
             capturedError = null;
             return null;
@@ -313,6 +320,12 @@ internal static class Program
         }
         public Func<object?> Action { get; }
         public TaskCompletionSource<object?> Completion { get; }
+        /// <summary>True once the caller stopped waiting (15 s timeout, or the
+        /// batch/cancel barrier drained the item). Abandoned items still in the
+        /// queue are skipped — their captured package closure frees instead of
+        /// being allocated for a discarded result. Items already running on a
+        /// worker cannot be preempted and run to completion as before.</summary>
+        public volatile bool Abandoned;
     }
 
     private static readonly System.Collections.Concurrent.BlockingCollection<SerializeWork> _serializeQueue =
@@ -347,14 +360,25 @@ internal static class Program
 
     private static void SerializeWorkerLoop()
     {
-        // Note: TryTake blocks indefinitely; items added after a saturating
-        // caller stops waiting are still executed (their result is discarded),
-        // preserving the prior orphaned-thread behavior. The CLI dies when the
-        // parent exits, and IsBackground threads don't block shutdown.
+        // TryTake blocks indefinitely; abandoned items are skipped rather than
+        // executed — running them kept their captured package graphs allocated
+        // for a result the caller had already discarded, which is what stacked
+        // in-flight import closures on top of the memory gate during
+        // saturated runs. Barriers (batch / cancel / post-export) drain
+        // abandoned items the same way via DrainSerializeQueue. The
+        // CLI dies when the parent exits, and IsBackground threads don't
+        // block shutdown.
         while (true)
         {
             if (!_serializeQueue.TryTake(out var work, Timeout.Infinite))
                 return; // collection completed
+            if (work.Abandoned)
+            {
+                // Caller gave up before this item started — skip the
+                // allocation entirely. Nothing is waiting on the completion.
+                work.Completion.TrySetResult(null);
+                continue;
+            }
             try
             {
                 work.Completion.TrySetResult(work.Action());
@@ -366,6 +390,32 @@ internal static class Program
                 try { work.Completion.TrySetException(ex); } catch { /* racing Wait timeout */ }
             }
         }
+    }
+
+    /// <summary>
+    /// Discard every queued serialize request, completing each with a null
+    /// result so the shared pool's callers aren't left waiting. At the
+    /// batch barrier and post-export reclaim no request can be mid-wait
+    /// (a live wait implies a live <c>Parallel.ForEach</c> iteration, and
+    /// those all belong to the batch that just finished), so this only drops
+    /// already-timed-out items whose captured package closures would
+    /// otherwise survive GC. During a global cancel the parallel bodies may
+    /// be wedged mid-iteration — completing parked callers with null lets a
+    /// body waiting inside its 15 s serialize wait return promptly, freeing
+    /// its in-flight import closure, instead of waiting out the timeout
+    /// while cancellation is pending.
+    /// </summary>
+    /// <returns>How many queued items were discarded.</returns>
+    private static int DrainSerializeQueue()
+    {
+        int dropped = 0;
+        while (_serializeQueue.TryTake(out var work))
+        {
+            work.Abandoned = true;
+            work.Completion.TrySetResult(null);
+            dropped++;
+        }
+        return dropped;
     }
 
     // ─── Constants ────────────────────────────────────────────────────
@@ -605,7 +655,10 @@ internal static class Program
                 var cancelledCts = _cts;
                 _cts = new CancellationTokenSource();
                 cancelledCts.Dispose();
-                Respond(new { type = "cancelled" });
+                // exporting=false tells the parent no export leg is actually
+                // running, so its cancel-escalation ladder must not arm — an
+                // idle cancel must never tear the mounted session down.
+                Respond(new { type = "cancelled", exporting = false });
                 break;
             case "quit":
                 Respond(new { type = "quit_ack" });
@@ -702,6 +755,13 @@ internal static class Program
                 {
                     case "cancel":
                         _cts.Cancel();
+                        // Discard abandoned serialize queue items at the same
+                        // time: requests whose caller already timed out are
+                        // pure retained package closures past this point, and
+                        // marking them done lets any parallel body parked in a
+                        // still-live 15 s serialize wait return promptly
+                        // instead of waiting out its timeout.
+                        DrainSerializeQueue();
                         // A cancel must stop the whole pending run, not just
                         // the current leg. The parent pipelines one export
                         // command per selected folder, and those queue here
@@ -715,7 +775,12 @@ internal static class Program
                         // reads) stay queued as they are quick and harmless.
                         var droppedCommands = _pendingCommands.Count;
                         _pendingCommands.Clear();
-                        Respond(new { type = "cancelled" });
+                        // exporting=true tells the parent the current leg is
+                        // still alive (dropped queued legs never report) — its
+                        // cancel-escalation ladder counts exactly this leg as
+                        // the one still owed an export_done.
+                        Respond(new { type = "cancelled", exporting = true,
+                                      queue_dropped = droppedCommands });
                         if (droppedCommands > 0)
                             Respond(new
                             {
@@ -1769,17 +1834,41 @@ internal static class Program
     }
 
     /// <summary>
-    /// Batch barrier: a blocking compacting GC returns LOS UObject graphs,
-    /// decoded pixel buffers and mesh LOD arrays to the OS, then — in
-    /// physical-only mode — the working set is trimmed so the OS stops
-    /// attributing parked-but-free pages to the exporter (no page-file
-    /// reliance). Afterwards the adaptive worker count is re-evaluated from
-    /// live usage: shed when pressed, restored when comfortable.
+    /// Pre-flight footprint check for a single asset whose worst-case decode
+    /// size is known before any allocation. The reactive gates above only
+    /// observe working-set growth once it has already happened — an asset
+    /// that needs more than the budget wedges its worker inside native
+    /// allocation (no GC safe point, no token poll ever fires) until an OOM
+    /// or an external kill. Refusing to start converts that unbounded stall
+    /// into an ordinary per-asset skip with a surfaced reason. No-op when no
+    /// budget is active.
+    /// </summary>
+    private static void RequireMemoryHeadroom(long estimateBytes, string what)
+    {
+        if (_memoryBudgetBytes <= 0 || estimateBytes <= 0) return;
+        var remaining = _hardGateBytes - CurrentWorkingSetBytes();
+        if (estimateBytes <= Math.Max(remaining, 0)) return;
+        throw new MemoryLimitExceededException(
+            $"{what} needs about {FormatByteAmount(estimateBytes)} which cannot fit inside the memory " +
+            $"limit ({FormatByteAmount(_memoryBudgetBytes)}, {FormatByteAmount(Math.Max(remaining, 0))} free under the gate right now) — asset skipped");
+    }
+
+    /// <summary>
+    /// Batch barrier: queued-but-abandoned serialize requests are discarded
+    /// first (their captured package closures are the one caller-scope
+    /// retention a saturated batch leaves behind), then a blocking compacting
+    /// GC returns LOS UObject graphs, decoded pixel buffers and mesh LOD
+    /// arrays to the OS, then — in physical-only mode — the working set is
+    /// trimmed so the OS stops attributing parked-but-free pages to the
+    /// exporter (no page-file reliance). Afterwards the adaptive worker count
+    /// is re-evaluated from live usage: shed when pressed, restored when
+    /// comfortable.
     /// </summary>
     private static void CollectAndTrimBetweenBatches()
     {
         if (_memoryBudgetBytes <= 0) return;
 
+        DrainSerializeQueue();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
@@ -1811,6 +1900,7 @@ internal static class Program
     {
         try
         {
+            DrainSerializeQueue();
             GCSettings.LargeObjectHeapCompactionMode =
                 GCLargeObjectHeapCompactionMode.CompactOnce;  // one-shot; auto-resets to Default
             GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
@@ -2131,6 +2221,39 @@ internal static class Program
         if (!visited.Add(objectPath))
             return true;
 
+        // Load the package and export its objects inside a helper frame that
+        // RETURNS before the dependency recursion below runs. A depth-N walk
+        // used to keep every level's loaded package — plus its whole
+        // ImportedPackages closure (each loaded IoPackage holds the packages
+        // it imports, transitively) — alive underneath the recursion, up to
+        // MaxDependencyDepth package graphs per worker, which is what drove
+        // large landscape/material chains past the memory gate. With the
+        // helper out of the way, at most one package graph lives per worker
+        // at a time and the barriers' aggressive GC can actually release
+        // them.
+        var (exported, refPaths) = ExportLoadedPackage(
+            gamePath, objectPath, lowerPath, nestedOutputDir, formats, depth);
+
+        if (refPaths.Count > 0)
+            ExportDependencies(refPaths, outputDir, formats, visited, depth + 1);
+
+        return exported;
+    }
+
+    /// <summary>
+    /// Load one package and export its objects, collecting the material and
+    /// texture refs for the caller's dependency walk. Package lifetime is
+    /// confined to this call — the caller recurses into
+    /// <see cref="ExportDependencies"/> with only the ref strings alive, so
+    /// each export worker holds at most one loaded package (and its
+    /// ImportedPackages closure) at a time instead of one per recursion
+    /// level. The "none were exportable" warning is emitted here, while the
+    /// exports list is still in scope to name the types.
+    /// </summary>
+    private static (bool exported, HashSet<string> refPaths) ExportLoadedPackage(
+        string gamePath, string objectPath, string lowerPath, string nestedOutputDir,
+        Dictionary<string, bool> formats, int depth)
+    {
         // Load the package and resolve all exports
         var exports = new List<UObject>();
         try
@@ -2148,13 +2271,13 @@ internal static class Program
         catch when (lowerPath.EndsWith(".upk"))
         {
             // UE3 .upk packages may not be parseable by CUE4Parse — fall back to raw binary export
-            return ExportRawFile(gamePath, nestedOutputDir);
+            return (ExportRawFile(gamePath, nestedOutputDir), []);
         }
 
         if (exports.Count == 0 && lowerPath.EndsWith(".upk"))
         {
             // No exports found — fall back to raw copy
-            return ExportRawFile(gamePath, nestedOutputDir);
+            return (ExportRawFile(gamePath, nestedOutputDir), []);
         }
 
         bool exported = false;
@@ -2207,7 +2330,7 @@ internal static class Program
             }
 
             // Serialize once — the JSON feeds both the props file and the
-            // dependency walk below.
+            // dependency walk in the caller.
             string? propsJson = null;
             var followRefs = depth < MaxDependencyDepth &&
                              (obj is UStaticMesh || obj is USkeletalMesh || obj is UMaterialInterface);
@@ -2231,16 +2354,13 @@ internal static class Program
                 CollectAssetRefs(propsJson, refPaths);
         }
 
-        if (refPaths.Count > 0)
-            ExportDependencies(refPaths, outputDir, formats, visited, depth + 1);
-
         if (!exported && exports.Count > 0)
         {
             var typeList = string.Join(", ", exports.Select(o => o.ExportType).Distinct());
             Respond(new { type = "warning", message = $"{Path.GetFileName(gamePath)}: loaded {exports.Count} object(s) [{typeList}] but none were exportable — check if these types need special handling" });
         }
 
-        return exported;
+        return (exported, refPaths);
     }
 
     // ─── Raw binary export (for .wem, .bnk, etc.) ────────────────────
@@ -2502,6 +2622,25 @@ internal static class Program
     // ─── Texture export ───────────────────────────────────────────────
     private static bool ExportTexture(UTexture2D texture, string outputDir)
     {
+        // Pre-flight: refuse to start a decode that cannot fit under the
+        // memory gate (see RequireMemoryHeadroom). Peak is bounded at
+        // 8 B/px — 4 B/px for the decompressed CTexture plus 4 B/px for the
+        // SKBitmap the writers convert into — and block-compressed formats
+        // decompress below that. GPU-decoded textures still return a
+        // CPU-side CTexture, so the estimate holds there too. Virtual
+        // textures stream their pages per-call but the CPU path composes the
+        // full page set at full resolution, so mip-0 dims bound those too.
+        // Without this, an oversized single asset balloons the working set
+        // inside native Skia allocation where no token poll or GC can
+        // rescue the run.
+        var mip = texture.GetMip(texture.GetFirstMipIndex());
+        var estimatedBytes = mip != null
+            ? (long)mip.SizeX * mip.SizeY * 8L
+            : 0L;
+        RequireMemoryHeadroom(
+            estimatedBytes,
+            $"Texture {texture.Name} ({mip?.SizeX ?? 0}×{mip?.SizeY ?? 0})");
+
         // Decode() now yields a CTexture (raw pixels + format) rather than an
         // SKBitmap. Convert once here so the TGA/PNG writers below stay as they
         // were rather than growing a second pixel-format path.

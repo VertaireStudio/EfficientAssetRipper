@@ -320,7 +320,7 @@ class AssetScanner:
     def seed_cache(self, entries: list[AssetEntry]):
         """Pre-populate the cache with previously resolved entries.
 
-        When scan() runs, any PSK path already present will be reused
+        When scan() runs, any mesh path already present will be reused
         instead of re-resolved.
         """
         self._cache = list(entries)
@@ -343,18 +343,20 @@ class AssetScanner:
         }
         self._cache.clear()
 
-        # 1. Find all PSK/PSKX files
-        log.info("Searching for PSK/PSKX files in %s", self.game_folder)
-        psk_files = self.sdk.find_psk_files(folder=self.game_folder)
-        total = len(psk_files)
-        log.info("Found %d PSK/PSKX files", total)
+        # 1. Find all supported mesh files (PSK/PSKX + GLB/FBX exports)
+        log.info(
+            "Searching for mesh files (psk/pskx/glb/fbx) in %s", self.game_folder
+        )
+        mesh_files = self.sdk.find_mesh_files(folder=self.game_folder)
+        total = len(mesh_files)
+        log.info("Found %d mesh files", total)
 
         if progress_callback:
             progress_callback(0, total, f"Found {total} meshes, resolving...")
 
         overrides = self.presets_data.get("material_overrides", {})
 
-        for idx, psk_path in enumerate(psk_files):
+        for idx, mesh_path in enumerate(mesh_files):
             if self._cancelled:
                 log.info("Scan cancelled at %d/%d", idx, total)
                 if progress_callback:
@@ -362,18 +364,18 @@ class AssetScanner:
                 break
 
             # Reuse cached entry if it was already resolved
-            cached_entry = existing.get(os.path.normcase(str(psk_path)))
+            cached_entry = existing.get(os.path.normcase(str(mesh_path)))
             if cached_entry is not None and cached_entry.mesh_props_found:
                 self._cache.append(cached_entry)
                 if progress_callback:
-                    progress_callback(idx, total, f"Cached: {psk_path.stem}")
+                    progress_callback(idx, total, f"Cached: {mesh_path.stem}")
                 continue
 
-            asset_name = psk_path.stem
-            entry = AssetEntry(psk_path=psk_path, name=asset_name)
+            asset_name = mesh_path.stem
+            entry = AssetEntry(psk_path=mesh_path, name=asset_name)
 
             # Classify by folder path
-            cat = classify(psk_path, self.game_folder)
+            cat = classify(mesh_path, self.game_folder)
             entry.category = cat.category
             entry.subcategory = cat.subcategory
 
@@ -424,6 +426,18 @@ class AssetScanner:
         # failed" — surface the latter via mesh_props_found=False so the GUI
         # shows scan_failed instead of no_materials.
         if not mat_refs:
+            if entry.psk_path.suffix.lower() not in (".psk", ".pskx"):
+                # GLB/FBX inputs have no PSK chunk structure to mine; the
+                # props material list is the only material source there
+                # (CUE4Parse GLBs are untextured but keep their slot names).
+                # Leave the entry's material list empty — its status becomes
+                # "no_materials", never a bogus "scan_failed".
+                log.info(
+                    "Props for %s has no materials and its %s input has no "
+                    "PSK binary to extract from",
+                    entry.name, entry.psk_path.suffix,
+                )
+                return
             psk_mat_names, ok = _extract_psk_materials(entry.psk_path)
             if not ok:
                 log.warning(

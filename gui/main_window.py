@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QRunnable, QThread, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QByteArray, QEvent, Qt, QRunnable, QThread, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -39,12 +39,11 @@ from gui.tga_previewer import TGAPreviewerPanel
 from gui.media_previewer import MediaPreviewerPanel
 from gui.mesh_previewer import MeshPreviewerPanel
 from gui.log_viewer import LogViewer
-from gui.psk_picker import PskPickerPanel
+from gui.mesh_picker import MeshPickerPanel
 from gui.queue_panel import QueuePanel
 from gui.text_viewer import TextViewer
 from gui.unpacker_panel import UnpackerPanel
 from gui.settings_panel import SettingsDialog
-import gui.theme as theme
 
 log = logging.getLogger(__name__)
 
@@ -330,14 +329,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # ── Central widget: empty placeholder ─────────────────────────
-        # Every panel ships as a QDockWidget; QMainWindow requires a
-        # central widget but ours has no chrome of its own. Profile
+        # ── No central widget ─────────────────────────────────────────
+        # Every panel ships as a QDockWidget; nothing lives in the middle.
+        # An empty placeholder central widget (even collapsed to zero) made
+        # Qt draw TWO separators between the left and right dock columns —
+        # one on each side of the zero-size placeholder. Omitting the
+        # central widget entirely keeps the fallback dock area and leaves
+        # exactly one draggable separator between the columns. Profile
         # selection moved to the Profiles menu, scan controls moved into
         # the Asset Browser dock.
-        central = QWidget()
-        self.setCentralWidget(central)
-        central.setMaximumSize(0, 0)  # collapse to zero so docks meet in the middle
 
         # Tracks the currently active profile so menu rebuilds can mark it
         # checked. Also used by busy-check / revert flow for menu-driven
@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
 
         # ── Build panels ──────────────────────────────────────────────
         self._browser = AssetBrowser()
-        self._psk_picker = PskPickerPanel()
+        self._mesh_picker = MeshPickerPanel()
         self._unpacker_panel = UnpackerPanel()
 
         self._queue = QueuePanel()
@@ -367,7 +367,7 @@ class MainWindow(QMainWindow):
         self._dock_specs: list[tuple[str, str, str, QWidget]] = [
             # (object_name,            menu label,        title,             widget)
             ("dock_unpacker",         "Unpacker",        "Unpacker",        self._unpacker_panel),
-            ("dock_psk_picker",       "PSK Picker",      "PSK Picker",      self._psk_picker),
+            ("dock_mesh_picker",      "Mesh Picker",     "Mesh Picker",     self._mesh_picker),
             ("dock_asset_browser",    "Asset Browser",   "Asset Browser",   self._browser),
             ("dock_queue",            "Queue",           "Queue",           self._queue),
             ("dock_log",              "Log",             "Log",             self._log),
@@ -392,7 +392,7 @@ class MainWindow(QMainWindow):
 
         # Friendly attributes for the rest of the file (and for tests).
         self._asset_browser_dock = self._docks["dock_asset_browser"]
-        self._psk_picker_dock = self._docks["dock_psk_picker"]
+        self._mesh_picker_dock = self._docks["dock_mesh_picker"]
         self._unpacker_dock = self._docks["dock_unpacker"]
         self._queue_dock = self._docks["dock_queue"]
         self._log_dock = self._docks["dock_log"]
@@ -453,8 +453,11 @@ class MainWindow(QMainWindow):
         self._browser.props_view_requested.connect(self._on_browser_props_view)
         self._browser.scan_requested.connect(self._start_scan)
         self._browser.cancel_scan_requested.connect(self._cancel_scan)
-        self._psk_picker.add_to_queue_requested.connect(self._add_picker_to_queue)
-        self._psk_picker.mesh_preview_requested.connect(self._on_mesh_preview)
+        self._mesh_previewer.log_message.connect(self._log.append)
+        self._mesh_picker.add_to_queue_requested.connect(self._add_picker_to_queue)
+        self._mesh_picker.mesh_preview_requested.connect(self._on_mesh_preview)
+        # Picker follows the Unpacker's live Mounted Folder for searches.
+        self._mesh_picker.set_search_root_provider(self._scan_root)
         self._unpacker_panel.psk_extracted.connect(self._on_psks_extracted)
         self._unpacker_panel.fbx_requested.connect(self._on_fbx_requested)
         self._unpacker_panel.log_message.connect(self._log.append)
@@ -488,19 +491,13 @@ class MainWindow(QMainWindow):
         self._raise_dock(self._tga_previewer_dock)
 
     def _on_mesh_preview(self, path: str):
-        """Load .psk in the Mesh Preview dock and surface it.
+        """Load a mesh file in the Mesh Preview dock and surface it.
 
-        glTF (.glb) / FBX exports preview externally: the built-in viewer is
-        a PSK parser, so anything else shows a hint instead of a parse error.
+        PSK/PSKX parse in-process via core.psk_reader; glTF (.glb/.gltf) and
+        FBX convert through headless Blender into geometry arrays the same
+        viewer can render.
         """
-        if not path.lower().endswith((".psk", ".pskx")):
-            self._log.append(
-                f"{Path(path).name}: glTF/FBX previews open in the system "
-                "default app (the built-in mesh viewer reads PSK only)", "info")
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-            self._raise_dock(self._mesh_previewer_dock)
-            return
-        self._mesh_previewer.load_psk(path)
+        self._mesh_previewer.load_mesh(path)
         self._raise_dock(self._mesh_previewer_dock)
 
     @staticmethod
@@ -683,10 +680,40 @@ class MainWindow(QMainWindow):
     # Dock layout (default + persistence)
     # ------------------------------------------------------------------
 
-    _LAYOUT_SCHEMA_VERSION = 4
+    _LAYOUT_SCHEMA_VERSION = 5
     _LAYOUT_KEY_GEOMETRY = "ui/main_window_geometry"
     _LAYOUT_KEY_STATE = "ui/main_window_state"
     _LAYOUT_KEY_SCHEMA = "ui/main_window_layout_schema"
+
+    # Dock-separator drag pinning. Separator hover highlighting goes through
+    # the stylesheet's :hover pseudo-state, which Qt re-evaluates per frame
+    # against the cursor — and the dragged separator rect only moves on
+    # Qt's coalescing timer, so fast drags made the accent line flicker
+    # off/on. While the left button is held on the window (separator drags
+    # deliver their mouse events to QMainWindow itself — the separator is
+    # part of the window's paint, not a child widget) we keep the
+    # "separatorDrag" property set; a QSS property rule pins the accent for
+    # the entire drag regardless of where the cursor momentarily is.
+    def _set_separator_drag(self, on: bool) -> None:
+        """Toggle the drag-pinned separator highlight (property + repolish)."""
+        if self.property("separatorDrag") == on:
+            return
+        self.setProperty("separatorDrag", on)
+        # Property selectors only re-evaluate on repolish. The separator is
+        # painted from the window's own styleObject, so repolishing just the
+        # window is enough — no need to walk the dock widgets.
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def event(self, e) -> bool:  # noqa: D401 — Qt override signature
+        if e.type() == QEvent.Type.MouseMove:
+            self._set_separator_drag(
+                QApplication.mouseButtons() == Qt.MouseButton.LeftButton
+            )
+        elif e.type() in (QEvent.Type.MouseButtonRelease,
+                          QEvent.Type.MouseButtonDblClick):
+            self._set_separator_drag(False)
+        return super().event(e)
 
     def _apply_default_dock_layout(self) -> None:
         """Factory layout.
@@ -700,7 +727,7 @@ class MainWindow(QMainWindow):
         ``removeDockWidget``-on-hidden-dock crash that Qt can hit on Windows.
         """
         d = self._docks
-        left = ("dock_unpacker", "dock_psk_picker", "dock_asset_browser",
+        left = ("dock_unpacker", "dock_mesh_picker", "dock_asset_browser",
                 "dock_queue", "dock_blend_combiner", "dock_log")
         right = ("dock_tga_previewer", "dock_mesh_previewer",
                  "dock_text_viewer", "dock_media_previewer")
@@ -715,8 +742,8 @@ class MainWindow(QMainWindow):
         # then that top cell splits into main tabs | queue (nested docking).
         self.splitDockWidget(d["dock_unpacker"], d["dock_log"], Qt.Orientation.Vertical)
         self.splitDockWidget(d["dock_unpacker"], d["dock_queue"], Qt.Orientation.Horizontal)
-        self.tabifyDockWidget(d["dock_unpacker"], d["dock_psk_picker"])
-        self.tabifyDockWidget(d["dock_psk_picker"], d["dock_asset_browser"])
+        self.tabifyDockWidget(d["dock_unpacker"], d["dock_mesh_picker"])
+        self.tabifyDockWidget(d["dock_mesh_picker"], d["dock_asset_browser"])
         self.tabifyDockWidget(d["dock_queue"], d["dock_blend_combiner"])
 
         # Right column: TGA/Mesh tabs above Text/Media tabs.
@@ -873,14 +900,33 @@ class MainWindow(QMainWindow):
     # Scanning
     # ------------------------------------------------------------------
 
+    def _scan_root(self) -> str:
+        """Folder the Asset Browser scan should search for PSK/PSKX files.
+
+        Resolution order: the Unpacker tab's live ``Mounted Folder`` field
+        (exports land there; it may have been edited since the profile was
+        loaded) → bridged ``unpack_output_dir`` → ``game_folder`` fallback
+        for single-directory setups where exports were made in place.
+        Matches the rule used by ``_add_picker_to_queue`` and the PSK picker.
+        """
+        panel = getattr(self, "_unpacker_panel", None)
+        mounted = panel.mounted_folder() if panel is not None else ""
+        return mounted or config.get("unpack_output_dir") or config.get("game_folder")
+
     def _start_scan(self):
-        game_folder = config.get("game_folder")
+        game_folder = self._scan_root()
         if not game_folder:
             QMessageBox.warning(
                 self, "No Game Folder",
                 "Set the game folder under Manage Profiles first."
             )
             return
+        if not os.path.isdir(game_folder):
+            self._log.append(
+                f"Mounted Folder does not exist: {game_folder} — set it on the "
+                "Unpacker tab, or run an export there first.",
+                "warning",
+            )
 
         dll_path = config.get("everything_dll") or None
 
@@ -940,7 +986,7 @@ class MainWindow(QMainWindow):
         # Seed picker with already-processed paths
         processed = [a.psk_path for a in assets if a.processed]
         if processed:
-            self._psk_picker.mark_processed(processed)
+            self._mesh_picker.mark_processed(processed)
 
         # Save cache asynchronously
         game_folder = config.get("game_folder")
@@ -1297,17 +1343,20 @@ class MainWindow(QMainWindow):
             self._log.append(f"Cannot save profile '{name}': {e}", "error")
             return
 
-        # Always merge picker state (psk_processed) — that's a record of work
+        # Always merge picker state (mesh_processed) — that's a record of work
         # done, not a path the user is editing.
-        data.update(self._psk_picker.collect_for_profile())
+        data.update(self._mesh_picker.collect_for_profile())
 
         # Path fields: only auto-merge when explicitly opted-in per profile.
         if data.get("auto_save_paths", False):
             data.update(self._unpacker_panel.collect_for_profile())
 
-        # blender_output_dir falls back to the legacy global key for users
-        # who haven't yet set it via Manage Profiles.
-        data["blender_output_dir"] = data.get("blender_output_dir", "") or config.get("output_dir")
+        # blender_output_dir is profile-owned; it must NOT fall back to the
+        # global ``output_dir`` — that bridge still holds the previously
+        # loaded profile's value after a switch, and pulling it in here
+        # would copy another profile's output folder into this one. The
+        # legacy global key is only ever a read-bridge (set by
+        # _load_profile), never a write source again.
 
         # Scan cache file is keyed by the saved game_dir, not whatever the
         # Unpacker tab has typed in right now.
@@ -1316,9 +1365,6 @@ class MainWindow(QMainWindow):
             import hashlib
             folder_hash = hashlib.md5(game_dir.encode()).hexdigest()[:12]
             data["scan_cache_file"] = f"scan_{folder_hash}.json"
-
-        # Persist colour scheme into the profile
-        data["color_scheme"] = config.get("color_scheme") or theme.current_scheme_name()
 
         self._profile_manager.save_profile(name, data)
         log.debug("Saved profile: %s", name)
@@ -1412,18 +1458,13 @@ class MainWindow(QMainWindow):
         config.set("game_folder", game_dir)
         config.set("unpack_output_dir", data.get("unpack_output_dir", ""))
         config.set("unpack_ue_version", data.get("ue_version", "GAME_UE5_4"))
+        # Bridge the blender output dir the same way — unconditionally, so a
+        # profile without one clears the bridge instead of leaving the
+        # previously loaded profile's folder behind.
+        config.set("output_dir", data.get("blender_output_dir", ""))
 
-        # Apply profile's colour scheme if it has one
-        profile_scheme = data.get("color_scheme", "")
-        if profile_scheme:
-            config.set("color_scheme", profile_scheme)
-            app = QApplication.instance()
-            if app:
-                theme.apply(app, profile_scheme)
-
-        blender_out = data.get("blender_output_dir", "")
-        if blender_out:
-            config.set("output_dir", blender_out)
+        # Appearance (theme) is deliberately NOT touched here — colour
+        # scheme is a global application Setting, not per-profile state.
 
         # Load scan cache for this profile
         self._browser.set_assets([])  # clear first
@@ -1450,10 +1491,10 @@ class MainWindow(QMainWindow):
                 # Seed picker with already-processed paths
                 processed = [a.psk_path for a in assets if a.processed]
                 if processed:
-                    self._psk_picker.mark_processed(processed)
+                    self._mesh_picker.mark_processed(processed)
 
         # Load PSK picker state (after cache so processed lists merge correctly)
-        self._psk_picker.load_from_profile(data)
+        self._mesh_picker.load_from_profile(data)
 
         self.setWindowTitle(f"EfficientAssetRipper v{__version__} — {name}")
 
@@ -1479,9 +1520,10 @@ class MainWindow(QMainWindow):
 
     def _add_picker_to_queue(self, paths: list[Path]):
         """Resolve PSK paths from the picker and add to queue."""
-        # Use unpack_output_dir (where exported PSK/props/TGA files live) when
-        # set; fall back to game_folder for single-directory setups.
-        game_folder = config.get("unpack_output_dir") or config.get("game_folder")
+        # Same root rule as the Asset Browser scan — live Unpacker "Mounted
+        # Folder" field first (exported PSK/props/TGA files live there), then
+        # bridged config value, then game_folder for single-directory setups.
+        game_folder = self._scan_root()
         if not game_folder:
             QMessageBox.warning(self, "No Game Folder", "Set the game folder under Manage Profiles first.")
             return
@@ -1638,7 +1680,7 @@ class MainWindow(QMainWindow):
             a.psk_path for a in self._browser.assets if a.processed
         ]
         if processed:
-            self._psk_picker.mark_processed(processed)
+            self._mesh_picker.mark_processed(processed)
 
     # ------------------------------------------------------------------
     # Reprocess
@@ -1714,7 +1756,7 @@ class MainWindow(QMainWindow):
         names = [a.name for a in assets]
         self._log.append(f"Removed {len(assets)} asset(s): {', '.join(names)}", "info")
         # Un-mark deleted assets in the picker so they become selectable again
-        self._psk_picker.unmark_processed([a.psk_path for a in assets])
+        self._mesh_picker.unmark_processed([a.psk_path for a in assets])
         self._save_cache()
 
     # ------------------------------------------------------------------
@@ -1722,7 +1764,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _rescan_selected(self, entries: list):
-        game_folder = config.get("game_folder")
+        game_folder = self._scan_root()
         if not game_folder:
             QMessageBox.warning(self, "No Game Folder", "Set the game folder under Manage Profiles first.")
             return

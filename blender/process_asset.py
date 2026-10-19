@@ -70,6 +70,10 @@ with open(manifest_path, "r", encoding="utf-8") as f:
 # Manifest validation (defence in depth — runner already pre-checks).
 # ---------------------------------------------------------------------------
 
+# Mesh input formats accepted in the standard mode. Mirrored from
+# core/blender_runner.py (defence in depth — the runner also pre-checks).
+_MESH_INPUT_EXTS = {".psk", ".pskx", ".glb", ".gltf", ".fbx"}
+
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".exr",
                ".hdr", ".bmp", ".webp", ".dds"}
 
@@ -90,8 +94,11 @@ def _validate_manifest(m: dict):
         _bail("Manifest missing output_path")
 
     psk_ext = os.path.splitext(psk_path)[1].lower()
-    if psk_ext not in (".psk", ".pskx"):
-        _bail(f"Manifest psk_path must end in .psk/.pskx (got {psk_ext!r})")
+    if psk_ext not in _MESH_INPUT_EXTS:
+        _bail(
+            "Manifest psk_path must end in .psk/.pskx/.glb/.gltf/.fbx "
+            f"(got {psk_ext!r})"
+        )
     if not os.path.isfile(psk_path):
         _bail(f"Manifest psk_path does not exist: {psk_path}")
 
@@ -183,27 +190,42 @@ def main():
     for arm in list(bpy.data.armatures):
         bpy.data.armatures.remove(arm)
 
-    # 3. Import PSK/PSKX
+    # 3. Import the mesh — dispatch by extension. PSK/PSKX go through the
+    # PSK addon; GLB/GLTF and FBX use Blender's bundled importers (both
+    # callable headless in Blender ≥ 2.80).
     try:
         ext = os.path.splitext(psk_path)[1].lower()
         if ext in (".psk", ".pskx"):
             result = bpy.ops.psk.import_file(filepath=psk_path)
+            op_name = "psk.import_file"
+        elif ext in (".glb", ".gltf"):
+            # filepath only — per Blender API docs, passing files=None to
+            # this op triggers an RNA collection error.
+            result = bpy.ops.import_scene.gltf(filepath=psk_path)
+            op_name = "import_scene.gltf"
+        elif ext == ".fbx":
+            result = bpy.ops.import_scene.fbx(filepath=psk_path)
+            op_name = "import_scene.fbx"
         else:
             status_msg("error", message=f"Unsupported file type: {ext}")
             sys.exit(1)
         # bpy.ops returns a set like {"FINISHED"}, {"CANCELLED"}, etc.
         if "CANCELLED" in (result or set()):
-            status_msg("error", message=f"PSK import cancelled by Blender for {psk_path}")
+            status_msg(
+                "error",
+                message=f"{op_name} import cancelled by Blender for {psk_path}",
+            )
             sys.exit(1)
         if not any(o.type == "MESH" for o in bpy.data.objects):
             status_msg(
                 "error",
-                message=f"PSK import produced no mesh objects for {psk_path}",
+                message=f"Mesh import produced no mesh objects for {psk_path}",
             )
             sys.exit(1)
+        # Wire token kept as "psk_imported" (informational only; fixtures).
         status_msg("progress", step="psk_imported")
     except Exception as e:
-        status_msg("error", message=f"PSK import failed: {e}")
+        status_msg("error", message=f"Mesh import failed: {e}")
         sys.exit(1)
 
     # 4. Wire materials

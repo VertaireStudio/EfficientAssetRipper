@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9-VS.3] - 2026-10-19
+
+### Added
+- **Mesh Picker (was PSK Picker)** — PSK/PSKX, GLB and FBX searched, queued
+  and processed together (`ext:psk;pskx;glb;fbx`, Format column + filter,
+  `dock_mesh_picker`, layout schema 5). Blender processes GLB/GLTF/FBX
+  inputs via its bundled importers, and the in-app Mesh Preview converts
+  GLB/GLTF/FBX through headless `blender/preview_convert.py` into numpy
+  geometry arrays (the factory scene is cleared pre-import, so no default
+  cube rides along). Profiles store `mesh_processed` (legacy
+  `psk_processed` migrates in on load).
+
+### Changed
+- Export Cancel acts instantly: an in-flight cancel shuts CUE4ParseCLI
+  down immediately (terminate with a 2 s bounded kill fallback) instead
+  of send-token-and-drain with the 30 s → quit → terminate → kill
+  escalation ladder. The interrupted run logs "Export cancelled — export
+  process shut down"; cancels clicked between legs stay graceful. The
+  kill's own `ProcessError.Crashed` report is recognized as the planned
+  teardown and no longer raised as a "CUE4ParseCLI process error".
+  After the shutdown the Unpacker rebuilds its session automatically
+  (fresh CLI + re-mount), so Export / Export Folder are clickable again
+  within seconds instead of sitting behind a manual re-mount step.
+- "Open Texture Presets JSON in Editor" moved inside the Export Formats
+  section of Settings; Browse buttons are content-sized so the label
+  never clips.
+
+### Fixed
+- Dock separators only highlight while in use — the hidden central
+  widget used to render two adjacent separators between the dock
+  columns; it's gone now (one separator), and the accent stays pinned
+  for the whole drag via a `separatorDrag` property rule (hover alone
+  flickered on fast pulls).
+
 ## [0.9-VS.2] - 2026-10-19
 
 Parallel GPU-accelerated exports with a memory budget, new export formats

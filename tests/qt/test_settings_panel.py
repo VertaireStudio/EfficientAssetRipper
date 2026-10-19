@@ -9,6 +9,8 @@ folder) live in the Manage Profiles dialog and are exercised in
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import config
@@ -166,7 +168,7 @@ def test_reset_to_defaults_repopulates_widgets_without_saving(qtbot, mock_qsetti
     until OK is clicked."""
     from PySide6.QtWidgets import QMessageBox
     config.set("psk_addon_name", "stale.addon.name")
-    config.set("timeout_seconds", 1234)  # in-range so the QSpinBox doesn't clamp
+    config.set("timeout_seconds", 1234)  # in-range so the slider doesn't clamp
     config.set("export_texture_format", "tga")
     config.set("export_mesh_format", "fbx")
 
@@ -249,11 +251,50 @@ def test_open_presets_warns_on_missing_path(qtbot, mock_qsettings, monkeypatch):
 def test_settings_dialog_timeout_clamped(qtbot, mock_qsettings):
     dlg = SettingsDialog()
     qtbot.addWidget(dlg)
-    # The QSpinBox range is 10..3600
+    # The slider range is 10..3600, mirroring the old spin box
     dlg.timeout.setValue(99999)
     assert dlg.timeout.value() <= 3600
     dlg.timeout.setValue(-50)
     assert dlg.timeout.value() >= 10
+
+
+# ---------------------------------------------------------------------------
+# Timeout / Export Threads — sliders carrying the spin box's semantics
+# ---------------------------------------------------------------------------
+
+def test_timeout_and_threads_sliders_keep_spinbox_semantics(qtbot, mock_qsettings):
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+
+    # Timeout: range preserved, live caption includes the unit.
+    assert dlg.timeout.minimum() == 10
+    assert dlg.timeout.maximum() == 3600
+    assert dlg.timeout.value() == config._DEFAULTS["timeout_seconds"]
+    assert dlg.timeout.label_text == "120 seconds"
+
+    # Export threads: the 0 stop reads "Auto (all cores)" like before.
+    assert dlg.export_threads.minimum() == 0
+    assert dlg.export_threads.maximum() == max(1, os.cpu_count() or 64)
+    assert dlg.export_threads.specialValueText() == "Auto (all cores)"
+    assert dlg.export_threads.label_text == "Auto (all cores)"
+    dlg.export_threads.setValue(4)
+    assert dlg.export_threads.value() == 4
+    assert dlg.export_threads.label_text == "4"
+
+
+def test_export_threads_slider_caps_at_cpu_thread_count(qtbot, mock_qsettings, monkeypatch):
+    """The top stop tracks this machine's thread count, not a fixed 64."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    assert dlg.export_threads.maximum() == 8
+    dlg.export_threads.setValue(8)       # top stop = full machine
+    assert dlg.export_threads.value() == 8
+    # An over-committed stored value clamps onto the detected cap.
+    dlg.export_threads.setValue(16)
+    assert dlg.export_threads.value() == 8
+    dlg.export_threads.setValue(0)
+    assert dlg.export_threads.label_text == "Auto (all cores)"
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +310,7 @@ def test_memory_policy_widgets_exist_with_defaults(qtbot, mock_qsettings):
     assert dlg.memory_limit.maximum() == 95
     assert dlg.memory_limit.value() == 0
     assert dlg.memory_limit.specialValueText() == "Unlimited"
+    assert dlg.memory_limit.label_text == "Unlimited"
     # No policy set → no absolute-budget hint is shown.
     assert dlg.memory_hint.text() == ""
 
@@ -285,6 +327,7 @@ def test_memory_policy_hint_shows_budget(qtbot, mock_qsettings, monkeypatch):
     dlg.physical_memory_only.setChecked(False)
     # 50% of the 8 GB currently free → 4.0 GB of 8.0 GB.
     assert "4.0 GB of 8.0 GB" in dlg.memory_hint.text()
+    assert dlg.memory_limit.label_text == "50 %"
 
     # Physical-only flips on → hint mentions the clamp.
     dlg.physical_memory_only.setChecked(True)

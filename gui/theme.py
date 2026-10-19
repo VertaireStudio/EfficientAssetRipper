@@ -274,7 +274,12 @@ QMainWindow {{
 }}
 
 /* Dock-area resize separators. 7px — the separator IS the hit zone, so a
-   hairline makes resizing nearly impossible to grab. */
+   hairline makes resizing nearly impossible to grab. The idle separator is
+   invisible (docks appear to meet edge-to-edge); it highlights on hover,
+   and the separatorDrag property rule below keeps the highlight pinned
+   for the entire duration of a drag — :hover alone flickers because Qt
+   re-evaluates it per frame against a cursor that lags the coalesced
+   separator rect on fast pulls. */
 QMainWindow::separator {{
     background-color: {c["bg_dark"]};
     width: 7px;
@@ -282,6 +287,10 @@ QMainWindow::separator {{
 }}
 
 QMainWindow::separator:hover {{
+    background-color: {c["accent"]};
+}}
+
+QMainWindow[separatorDrag="true"]::separator {{
     background-color: {c["accent"]};
 }}
 
@@ -747,6 +756,21 @@ QSlider::handle:horizontal {{
 
 QSlider::handle:horizontal:hover {{
     background: {c["accent_hover"]};
+}}
+
+/* Stylesheet colors override the palette, so disabled sliders need
+   explicit rules or they keep looking interactive (LabeledSlider-based
+   settings such as WebP quality start disabled for gated formats). */
+QSlider::groove:horizontal:disabled {{
+    background: {c["bg_dark"]};
+}}
+
+QSlider::handle:horizontal:disabled {{
+    background: {c["text_disabled"]};
+}}
+
+QLabel[cssClass="slider-value"]:disabled {{
+    color: {c["text_disabled"]};
 }}
 
 /* ===== Links ======================================================= */

@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -36,7 +35,7 @@ from PySide6.QtWidgets import (
 import config
 from gui.color_scheme_dialog import ColorSchemeDialog
 from gui.color_schemes import list_scheme_names
-from gui.widgets import CollapsibleSection, PathPicker
+from gui.widgets import CollapsibleSection, LabeledSlider, PathPicker
 import gui.theme as theme
 
 
@@ -136,14 +135,16 @@ class SettingsDialog(QDialog):
         self.addon_name = QLineEdit(config.get("psk_addon_name"))
         proc_form.addRow("PSK Import Addon:", self.addon_name)
 
-        self.timeout = QSpinBox()
-        self.timeout.setRange(10, 3600)
+        self.timeout = LabeledSlider(10, 3600)
         self.timeout.setSuffix(" seconds")
         self.timeout.setValue(config.get_int("timeout_seconds") or 120)
         proc_form.addRow("Timeout per Asset:", self.timeout)
 
-        self.export_threads = QSpinBox()
-        self.export_threads.setRange(0, 64)
+        # The top stop is this machine's logical thread count — the CLI can't
+        # usefully queue more workers than cores, and a fixed 64-slot groove
+        # on an 8-core box would just mislead. Floor >1 row keeps the slider
+        # usable if detection fails (os.cpu_count() can return None).
+        self.export_threads = LabeledSlider(0, max(1, os.cpu_count() or 64))
         self.export_threads.setSpecialValueText("Auto (all cores)")
         self.export_threads.setValue(config.get_int("unpacker_export_threads"))
         self.export_threads.setToolTip(
@@ -176,8 +177,7 @@ class SettingsDialog(QDialog):
         )
         proc_form.addRow("", self.physical_memory_only)
 
-        self.memory_limit = QSpinBox()
-        self.memory_limit.setRange(0, 95)
+        self.memory_limit = LabeledSlider(0, 95)
         self.memory_limit.setSpecialValueText("Unlimited")
         self.memory_limit.setSuffix(" %")
         try:
@@ -216,8 +216,7 @@ class SettingsDialog(QDialog):
         self.webp_mode.addItems(["lossless", "lossy"])
         self.webp_mode.setCurrentText(str(config.get("export_texture_webp_mode")))
         self.webp_mode.currentTextChanged.connect(self._on_webp_mode_changed)
-        self.webp_quality = QSpinBox()
-        self.webp_quality.setRange(1, 100)
+        self.webp_quality = LabeledSlider(1, 100)
         self.webp_quality.setValue(int(config.get("export_texture_webp_quality")))
         self.webp_quality.setSuffix(" %")
         self.webp_quality.setToolTip(
@@ -246,17 +245,21 @@ class SettingsDialog(QDialog):
         fmt_form.addRow("", mesh_hint)
 
         self._on_texture_format_changed(self.texture_format.currentText())
-        fmt_section.set_content_layout(fmt_form)
-        layout.addWidget(fmt_section)
 
-        # --- Presets shortcut (one-shot action, not a section) ---
+        # --- Presets shortcut (lives inside the Export Formats section,
+        # right under the format pickers it belongs to) ---
         presets_btn = QPushButton("Open Texture Presets JSON in Editor")
         presets_btn.clicked.connect(self._open_presets)
         presets_row = QHBoxLayout()
         presets_row.addStretch()
         presets_row.addWidget(presets_btn)
         presets_row.addStretch()
-        layout.addLayout(presets_row)
+
+        fmt_content = QVBoxLayout()
+        fmt_content.addLayout(fmt_form)
+        fmt_content.addLayout(presets_row)
+        fmt_section.set_content_layout(fmt_content)
+        layout.addWidget(fmt_section)
 
         # --- Appearance: theme picker + shortcut to the colour-scheme dialog ---
         appearance_section = CollapsibleSection("Appearance", start_expanded=True)
@@ -271,8 +274,7 @@ class SettingsDialog(QDialog):
         appearance_grid.addWidget(customize_btn, 0, 2)
         appearance_grid.addWidget(_divider(), 1, 0, 1, 4)
         appearance_grid.addWidget(QLabel("UI Scale:"), 2, 0)
-        self.ui_scale = QSpinBox()
-        self.ui_scale.setRange(theme.UI_SCALE_MIN, theme.UI_SCALE_MAX)
+        self.ui_scale = LabeledSlider(theme.UI_SCALE_MIN, theme.UI_SCALE_MAX)
         self.ui_scale.setSingleStep(theme.UI_SCALE_STEP)
         self.ui_scale.setSuffix("%")
         self.ui_scale.setValue(round(theme.ui_scale() * 100))
@@ -394,8 +396,9 @@ class SettingsDialog(QDialog):
         return True
 
     def _save(self):
-        # Clamp the timeout into a sane range (the QSpinBox already constrains
-        # via setRange, but be defensive in case the constraint changes).
+        # Clamp the timeout into a sane range (the slider's setValue already
+        # constrains via its range, but be defensive in case the constraint
+        # changes).
         self.timeout.setValue(max(10, min(self.timeout.value(), 3600)))
 
         if not self._validate_paths():
@@ -604,22 +607,24 @@ class SettingsDialog(QDialog):
                     count, msg = sdk.test_folder_search(gf)
                     results.append(("Folder Search", count > 0, msg))
 
-                    # Try finding PSK files. Zero hits is not a failure — a
-                    # packed/original game folder has no PSKs until meshes
+                    # Try finding mesh files. Zero hits is not a failure — a
+                    # packed/original game folder has no meshes until they
                     # are exported from the Unpacker.
-                    psk_files = sdk.find_psk_files(folder=gf)
-                    if psk_files:
+                    mesh_files = sdk.find_mesh_files(folder=gf)
+                    if mesh_files:
                         results.append((
-                            "PSK Search",
+                            "Mesh Search",
                             True,
-                            f"Found {len(psk_files)} PSK/PSKX files, e.g.: {psk_files[0].name}",
+                            f"Found {len(mesh_files)} mesh files "
+                            f"(psk/pskx/glb/fbx), e.g.: {mesh_files[0].name}",
                         ))
                     else:
                         results.append((
-                            "PSK Search",
+                            "Mesh Search",
                             True,
-                            "No PSK/PSKX files yet — normal for a packed game "
-                            "folder; they appear after exporting meshes",
+                            "No mesh files (psk/pskx/glb/fbx) yet — normal for "
+                            "a packed game folder; they appear after exporting "
+                            "meshes",
                         ))
             except Exception as e:
                 results.append(("Everything SDK", False, f"Error: {e}"))

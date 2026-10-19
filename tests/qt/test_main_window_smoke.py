@@ -83,7 +83,7 @@ def test_status_bar_initial_message(main_window):
 def test_left_docks_have_browser_picker_unpacker(main_window):
     """Each left-side panel exists as a QDockWidget with a stable objectName."""
     object_names = {dock.objectName() for dock in main_window._docks.values()}
-    assert {"dock_asset_browser", "dock_psk_picker", "dock_unpacker"}.issubset(object_names)
+    assert {"dock_asset_browser", "dock_mesh_picker", "dock_unpacker"}.issubset(object_names)
 
 
 def test_queue_log_and_combiner_docks_exist(main_window):

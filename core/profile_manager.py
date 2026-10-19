@@ -34,7 +34,10 @@ _RESERVED_NAMES = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
-# Keys that live per-profile (everything else stays in global QSettings)
+# Keys that live per-profile (everything else stays in global QSettings).
+# Appearance keys (color_scheme / custom_schemes) deliberately stayed out —
+# they are application Settings, not per-game config, and storing them here
+# made theme changes flip every time the user switched profiles.
 PROFILE_KEYS = {
     "game_dir",
     "ue_version",
@@ -43,9 +46,7 @@ PROFILE_KEYS = {
     "blender_output_dir",
     "mappings_path",
     "scan_cache_file",
-    "psk_processed",
-    "color_scheme",
-    "custom_schemes",
+    "mesh_processed",
     "auto_save_paths",
     "texture_preset",
     "material_overrides",
@@ -61,14 +62,17 @@ _EMPTY_PROFILE: dict = {
     "blender_output_dir": "",
     "mappings_path": "",
     "scan_cache_file": "",
-    "psk_processed": [],
-    "color_scheme": "",
-    "custom_schemes": {},
+    "mesh_processed": [],
     "auto_save_paths": False,
     "texture_preset": "default_pbr",
     "material_overrides": {},
     "auto_resolve_fallback": True,
 }
+
+# Appearance keys written by older app versions. They now belong to
+# application Settings and are stripped from profiles on load so a stale
+# copy can't resurface into a save later.
+_LEGACY_APPEARANCE_KEYS = ("color_scheme", "custom_schemes")
 
 
 def _safe_path(name: str) -> Path:
@@ -199,10 +203,8 @@ class ProfileManager:
             if k == "aes_keys" and not isinstance(data[k], list):
                 log.warning("profile %s: aes_keys is %s, resetting to []", name, type(data[k]).__name__)
                 data[k] = []
-            elif k == "psk_processed" and not isinstance(data[k], list):
+            elif k == "mesh_processed" and not isinstance(data[k], list):
                 data[k] = []
-            elif k == "custom_schemes" and not isinstance(data[k], dict):
-                data[k] = {}
             elif k == "auto_save_paths" and not isinstance(data[k], bool):
                 data[k] = bool(data[k])
             elif k == "material_overrides" and not isinstance(data[k], dict):
@@ -212,6 +214,31 @@ class ProfileManager:
                 data[k] = bool(data[k])
             elif k == "texture_preset" and not isinstance(data[k], str):
                 data[k] = "default_pbr"
+        # Legacy 'psk_processed' → 'mesh_processed' migration. The Mesh Picker
+        # renamed its processed-record key when it started handling PSK, GLB
+        # and FBX files together; older profiles still carry the old name.
+        # Merge (path-union) so neither a re-processed path nor a re-exported
+        # mesh loses its record.
+        legacy_processed = data.pop("psk_processed", [])
+        if legacy_processed and isinstance(legacy_processed, list):
+            merged = list(data.get("mesh_processed", []))
+            seen = set(merged)
+            for p in legacy_processed:
+                if p and p not in seen:
+                    merged.append(p)
+                    seen.add(p)
+            data["mesh_processed"] = merged
+
+        # Drop legacy appearance keys — theme/scheme state is application
+        # Settings (QSettings) and must not ride along in profile JSON.
+        for legacy in _LEGACY_APPEARANCE_KEYS:
+            if legacy in data:
+                data.pop(legacy)
+                log.debug(
+                    "profile %s: dropped legacy appearance key %r",
+                    name, legacy,
+                )
+
         if defaulted:
             log.info("profile %s: filled defaults for %s", name, ", ".join(defaulted))
 
@@ -331,7 +358,7 @@ class ProfileManager:
             "blender_output_dir": blender_out,
             "mappings_path": mappings,
             "scan_cache_file": scan_cache_file,
-            "psk_processed": [],
+            "mesh_processed": [],
         })
         log.info("Migrated QSettings → Default profile (game_dir=%s)", game_dir)
         return "Default"

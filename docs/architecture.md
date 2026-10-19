@@ -32,7 +32,7 @@ Two big subsystems live in one repo:
 | [blender/](../blender/) | Scripts run **inside** Blender as a subprocess (`blender --background --python ...`). They `import bpy` — do NOT import from `core/` or `gui/`. |
 | [cue4parse_cli/](../cue4parse_cli/) | .NET 10.0 single-file CLI, embeds CUE4Parse + Newtonsoft.Json. The Python side never reads `.pak` directly. |
 | [data/texture_presets.json](../data/texture_presets.json) | Texture-suffix → PBR-slot rules and per-material overrides. Single source of truth for wiring decisions. |
-| [profiles/](../profiles/) | Per-game JSON (gitignored). Has `game_dir`, `aes_keys`, `ue_version`, `psk_processed`, etc. |
+| [profiles/](../profiles/) | Per-game JSON (gitignored). Has `game_dir`, `aes_keys`, `ue_version`, `mesh_processed`, etc. |
 | [cache/](../cache/), [outputs/](../outputs/), [logs/](../logs/) | Gitignored runtime data. `cache/scan_<md5>.json` keyed by game folder hash. `cache/queue_checkpoint.json` survives interrupted batches. |
 | [build.bat](../build.bat) | PyInstaller `--onedir` build that also dotnet-publishes the CLI and zips everything. |
 | [sync.ps1](../sync.ps1) | Robocopy of gitignored `profiles/`/`cache/` to a backup target via `$env:EAR_SYNC_PATH`. Don't auto-run. |
@@ -74,9 +74,10 @@ Two big subsystems live in one repo:
    `mesh_props_found=True` are reused.
 8. **Profile vs global settings.** Keys in
    `core/profile_manager.PROFILE_KEYS` belong to the active profile JSON;
-   everything else lives in QSettings. Switching profiles re-reads the
-   per-game state. `migrate_from_qsettings` runs on first launch to seed
-   a `Default` profile.
+   everything else lives in QSettings — appearance keys (`color_scheme`,
+   `custom_schemes`) are application Settings and never stored per-profile.
+   Switching profiles re-reads the per-game state. `migrate_from_qsettings`
+   runs on first launch to seed a `Default` profile.
 9. **Defensive profile loading.** Corrupt JSON is renamed to
    `<name>.json.corrupt-<ts>` and the loader returns empty defaults so a
    single bad profile cannot brick the launcher.

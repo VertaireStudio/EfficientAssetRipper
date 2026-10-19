@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QProcess, Signal, Slot
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal, Slot
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,18 @@ class UnpackerProcess(QObject):
         # DOTNET_gcServer=0). Lets the panel detect a memory-settings drift
         # and remount with the correct mode.
         self.started_gc_mode = "server"
+
+        # Cancel accounting. ``_outstanding_exports`` counts the export legs
+        # the CLI still owes an ``export_done`` for (pipeline of one export
+        # command per selection). Cancel does not wait for a CLI response:
+        # with a leg in flight the process is shut down immediately
+        # (terminate → short bounded kill), because the CLI's cancel token
+        # is only observed at asset boundaries and inside its memory gate —
+        # a leg wedged inside a native allocation would never poll it.
+        self._outstanding_exports = 0
+        self._cancel_kill_delay_ms = 2_000  # terminate → kill bound (ms)
+        self._cancel_timer: QTimer | None = None
+        self._cancel_shutdown_requested = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -110,6 +122,7 @@ class UnpackerProcess(QObject):
             return False
 
         self._buffer = ""
+        self._cancel_shutdown_requested = False
         self.started_gc_mode = "workstation" if (env_overrides or {}).get("DOTNET_gcServer") == "0" else "server"
         log.info("CUE4ParseCLI started (%s GC): %s", self.started_gc_mode, cli_path)
         self.process_ready.emit()
@@ -117,6 +130,8 @@ class UnpackerProcess(QObject):
 
     def stop(self):
         """Gracefully shut down the subprocess."""
+        self._disarm_cancel_escalation()
+        self._outstanding_exports = 0
         if self._proc and self._proc.state() == QProcess.ProcessState.Running:
             self._send({"cmd": "quit"})
             if not self._proc.waitForFinished(3000):
@@ -246,8 +261,71 @@ class UnpackerProcess(QObject):
             cmd["physical_only"] = True
 
     def cancel(self) -> None:
-        """Cancel the current export operation."""
-        self._send({"cmd": "cancel"})
+        """Cancel the current export operation.
+
+        A cancel does not wait for the CLI to respond: when an export leg is
+        in flight the CLI process is shut down immediately (terminate,
+        followed by a short bounded kill if the graceful stop is ignored).
+        The session ends with the export — re-mount for further work — and
+        the panel reports the interrupted run. Idle cancels (no leg
+        outstanding, e.g. a click between legs) still send the graceful
+        cancel token, which the CLI observes at its next boundary without
+        ending the session.
+        """
+        self._disarm_cancel_escalation()
+        proc = self._proc
+        if proc is None or self._outstanding_exports <= 0:
+            # Idle corner — nothing to tear down; the token is honored
+            # (and acked) at the CLI's next boundary.
+            self._send({"cmd": "cancel"})
+            return
+        log.warning("Cancel during export — shutting CUE4ParseCLI down immediately")
+        self.warning.emit(
+            "Export cancelled — shutting the export process down immediately."
+        )
+        self._cancel_shutdown_requested = True
+        self._outstanding_exports = 0
+        proc.terminate()
+        # Graceful shutdown has a short bound: a leg wedged inside native
+        # code ignores SIGTERM/WM_CLOSE exactly like the old ladder assumed.
+        timer = QTimer(self)  # parented → dies with this QObject
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._on_cancel_kill_timeout)
+        self._cancel_timer = timer
+        timer.start(self._cancel_kill_delay_ms)
+
+    # ------------------------------------------------------------------
+    # Cancel teardown: immediate shutdown with a bounded kill fallback
+    # ------------------------------------------------------------------
+
+    @property
+    def cancel_shutdown_requested(self) -> bool:
+        """True when the last cancel tore the CLI down immediately (so the
+        panel can word the interrupted-export note as user-acted, not a
+        crash)."""
+        return self._cancel_shutdown_requested
+
+    def _disarm_cancel_escalation(self) -> None:
+        if self._cancel_timer is not None:
+            self._cancel_timer.stop()
+            self._cancel_timer.deleteLater()
+            self._cancel_timer = None
+
+    def _on_cancel_kill_timeout(self) -> None:
+        """The graceful shutdown set on cancel was ignored — kill hard."""
+        if not self.is_running:
+            return
+        try:
+            log.warning("Cancel fallback: killing CUE4ParseCLI")
+            if self._proc is not None:
+                self._proc.kill()
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            log.exception("Cancel kill fallback failed")
+
+    def _on_export_report(self) -> None:
+        """One export leg finished — account it and disarm the ladder."""
+        self._outstanding_exports = max(0, self._outstanding_exports - 1)
+        self._disarm_cancel_escalation()
 
     def get_props(self, vfs_path: str) -> None:
         """Request full JSON properties for a uasset file."""
@@ -346,6 +424,11 @@ class UnpackerProcess(QObject):
             return
         line = json.dumps(obj, separators=(",", ":")) + "\n"
         self._proc.write(line.encode("utf-8"))
+        # Every export flavor ("export", "export_folder", "export_*_audio",
+        # "export_video") posts exactly one export_done when its leg drains —
+        # count it so cancel only tears the CLI down for live legs.
+        if str(obj.get("cmd", "")).startswith("export"):
+            self._outstanding_exports += 1
 
     @Slot()
     def _on_stdout(self):
@@ -388,10 +471,22 @@ class UnpackerProcess(QObject):
     @Slot(int, QProcess.ExitStatus)
     def _on_finished(self, exit_code, exit_status):
         log.info("CUE4ParseCLI exited with code %d", exit_code)
+        self._disarm_cancel_escalation()
+        self._outstanding_exports = 0
         self.process_ended.emit()
+        # Clear after the emit: the panel's direct-connected slot reads the
+        # flag synchronously during process_ended to word its abort note.
+        self._cancel_shutdown_requested = False
 
     @Slot(QProcess.ProcessError)
     def _on_error(self, err):
+        if self._cancel_shutdown_requested:
+            # Our own cancel teardown just killed the process, which QProcess
+            # reports as ProcessError.Crashed — expected, not a failure. The
+            # panel already notes the cancelled export via process_ended, so
+            # a synthetic "process crashed" error here would only alarm.
+            log.info("CUE4ParseCLI process errored (%s) after cancel shutdown", err)
+            return
         msg = f"CUE4ParseCLI process error: {err}"
         log.error(msg)
         self.error.emit(msg)
@@ -427,6 +522,7 @@ class UnpackerProcess(QObject):
             )
 
         elif msg_type == "export_done":
+            self._on_export_report()
             self.export_done.emit(
                 msg.get("succeeded", []),
                 msg.get("failed", []),
@@ -498,6 +594,13 @@ class UnpackerProcess(QObject):
 
         elif msg_type == "cancelled":
             log.info("Export cancelled by user")
+            # The CLI acks Cancel instantly while the export thread is still
+            # draining — or wedged. `exporting` (added CLI-side) says whether
+            # a leg actually survived; idle cancels reset the count to zero,
+            # so the escalation ladder can never arm for them.
+            self._outstanding_exports = 1 if bool(msg.get("exporting")) else 0
+            if self._outstanding_exports == 0:
+                self._disarm_cancel_escalation()
 
         elif msg_type == "quit_ack":
             pass  # Expected during shutdown

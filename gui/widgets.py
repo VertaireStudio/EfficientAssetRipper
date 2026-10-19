@@ -9,9 +9,11 @@ from PySide6.QtGui import QAction, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMenu,
     QPushButton,
+    QSlider,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -20,6 +22,242 @@ from PySide6.QtWidgets import (
 
 
 LAZY_PLACEHOLDER = "__placeholder__"
+
+
+class _WheelGatedSlider(QSlider):
+    """QSlider that defers unfocused mouse-wheel input to its parent.
+
+    A slider inside a ``QScrollArea`` (e.g. the settings dialog) otherwise
+    swallows the wheel while the pointer merely hovers over it and silently
+    changes its own value. Ignoring the event while unfocused lets it bubble
+    up the parent chain so the scroll area keeps scrolling naturally; the
+    slider still responds to the wheel once focused (click or Tab to it).
+    """
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class LabeledSlider(QWidget):
+    """Horizontal slider with a live value label — a QSpinBox replacement
+    for bounded settings (percentages, quality, scale).
+
+    The public surface mirrors QSpinBox's numeric API (``value()``
+    ``setValue()`` ``minimum()`` ``maximum()`` ``setRange()``
+    ``setSingleStep()`` ``setSuffix()`` ``setSpecialValueText()``
+    ``specialValueText()`` plus a ``valueChanged`` signal) so call sites
+    written against a spin box keep working unchanged.
+
+    The slider indexes tick positions (``0..N-1``) internally and maps them
+    to real values, which makes non-1 steps (e.g. UI scale snapping to
+    10 %) behave consistently while dragging — QSlider's own single-step
+    setting does not affect drag movement.
+
+    Memory-leak note: both children are owned through the layout/parent
+    chain, so nothing external holds them and Qt tears the whole subtree
+    down (including this widget's internal signal wiring) when the dialog
+    is destroyed. No timers, no event filters on foreign objects.
+    """
+
+    valueChanged = Signal(int)
+
+    def __init__(
+        self,
+        minimum: int,
+        maximum: int,
+        *,
+        value: int | None = None,
+        step: int = 1,
+        suffix: str = "",
+        special_text: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        if int(maximum) < int(minimum):
+            raise ValueError("maximum must be >= minimum")
+
+        self._minimum = int(minimum)
+        self._maximum = int(maximum)
+        self._step = max(1, int(step))
+        self._suffix = suffix
+        self._special_text = special_text
+        self._value = self._minimum
+
+        self._slider = _WheelGatedSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, self._tick_count() - 1)
+        self._slider.setSingleStep(1)  # keyboard/wheel step = one tick
+
+        self._label = QLabel()
+        self._label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        # Scoped so the theme can gray the caption out when the slider is
+        # disabled (styling a plain QLabel globally would be too broad).
+        self._label.setProperty("cssClass", "slider-value")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._slider, 1)
+        layout.addWidget(self._label)
+
+        # Refresh the label before wiring the signal so construction never
+        # emits to handlers the caller hasn't connected yet.
+        self._update_label_width()
+        self._refresh_label()
+
+        self._slider.valueChanged.connect(self._on_tick_changed)
+        if value is not None:
+            self.setValue(value)
+
+    # -- Mapping between slider tick positions and real values ------------
+
+    def _tick_count(self) -> int:
+        """Number of representable stops on the slider groove."""
+        span = self._maximum - self._minimum
+        count = span // self._step + 1
+        if span % self._step:
+            # Non-divisible span: one extra stop pins the far end of the
+            # groove to ``maximum`` (all other stops stay on the step grid).
+            count += 1
+        return count
+
+    def _tick_to_value(self, tick: int) -> int:
+        last = self._tick_count() - 1
+        if tick >= last:
+            return self._maximum
+        return self._minimum + tick * self._step
+
+    def _value_to_tick(self, value: int) -> int:
+        value = max(self._minimum, min(int(value), self._maximum))
+        offset = value - self._minimum
+        last = self._tick_count() - 1
+        if (self._maximum - self._minimum) % self._step:
+            # Above the top regular step → clamp onto the pinned end stop.
+            if offset > (last - 1) * self._step:
+                return last
+        # Integer half-up rounding onto the step grid.
+        tick = (offset * 2 + self._step) // (2 * self._step)
+        return max(0, min(tick, last))
+
+    # -- Internals ---------------------------------------------------------
+
+    def _refresh_label(self) -> None:
+        self._label.setText(self._fmt_value(self._value))
+
+    def _fmt_value(self, value: int) -> str:
+        if self._special_text and value == self._minimum:
+            return self._special_text
+        return f"{value}{self._suffix}"
+
+    def _update_label_width(self) -> None:
+        """Reserve the widest expected caption so the label never jitters
+        while the slider is being dragged (double-digit ↔ triple-digit)."""
+        fm = self._label.fontMetrics()
+        candidates = [
+            f"{self._maximum}{self._suffix}",
+            f"{self._minimum}{self._suffix}",
+        ]
+        if self._special_text:
+            candidates.append(self._special_text)
+        self._label.setMinimumWidth(
+            max(fm.horizontalAdvance(text) for text in candidates) + 4
+        )
+
+    def _set_value_internal(self, value: int) -> None:
+        """Assign ``self._value``, refresh the caption, notify listeners.
+
+        QSpinBox parity: setting the same value again does not emit.
+        """
+        if value == self._value:
+            return
+        self._value = value
+        self._refresh_label()
+        self.valueChanged.emit(value)
+
+    def _on_tick_changed(self, tick: int) -> None:
+        self._set_value_internal(self._tick_to_value(tick))
+
+    def _rebuild_ticks(self) -> None:
+        """Re-derive the groove after range/step changes, keeping the
+        current value (clamped into the new bounds)."""
+        self._slider.blockSignals(True)
+        self._slider.setRange(0, self._tick_count() - 1)
+        self._slider.blockSignals(False)
+        self.setValue(self._value)
+
+    # -- QSpinBox-compatible public API ------------------------------------
+
+    def minimum(self) -> int:
+        return self._minimum
+
+    def maximum(self) -> int:
+        return self._maximum
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, value: int) -> None:
+        value = max(self._minimum, min(int(value), self._maximum))
+        tick = self._value_to_tick(value)
+        if tick != self._slider.value():
+            # Drive the slider silently; the mapped value below performs the
+            # emitting so there's exactly one signal per change even when
+            # the snapped tick differs from the requested value.
+            self._slider.blockSignals(True)
+            self._slider.setValue(tick)
+            self._slider.blockSignals(False)
+        # Store the value the slider geometry actually represents — a step
+        # grid may snap the requested value onto a neighbouring stop.
+        self._set_value_internal(self._tick_to_value(tick))
+
+    def setRange(self, minimum: int, maximum: int, step: int | None = None):
+        if int(maximum) < int(minimum):
+            raise ValueError("maximum must be >= minimum")
+        self._minimum = int(minimum)
+        self._maximum = int(maximum)
+        if step is not None:
+            self._step = max(1, int(step))
+        self._rebuild_ticks()
+        self._update_label_width()
+        self._refresh_label()
+
+    def setSingleStep(self, step: int) -> None:
+        step = max(1, int(step))
+        if step == self._step:
+            return
+        self._step = step
+        self._rebuild_ticks()
+
+    def setSuffix(self, suffix: str) -> None:
+        self._suffix = suffix
+        self._update_label_width()
+        self._refresh_label()
+
+    def setSpecialValueText(self, text: str) -> None:
+        self._special_text = text
+        self._update_label_width()
+        self._refresh_label()
+
+    def specialValueText(self) -> str:
+        return self._special_text
+
+    # -- QWidget overrides --------------------------------------------------
+
+    def setToolTip(self, text: str) -> None:  # type: ignore[override]
+        # QWidget.setToolTip is non-virtual on the C++ side, but PySide6
+        # resolves the Python override for direct calls — always route the
+        # description onto the slider too, since a child widget shows only
+        # its own tooltip while hovered, never the parent's.
+        super().setToolTip(text)
+        self._slider.setToolTip(text)
+
+    @property
+    def label_text(self) -> str:
+        """Current caption text (tests observe this instead of privates)."""
+        return self._label.text()
 
 
 class PathPicker(QWidget):
@@ -52,7 +290,8 @@ class PathPicker(QWidget):
         layout.addWidget(self.line_edit)
 
         btn = QPushButton("Browse...")
-        btn.setFixedWidth(80)
+        # No fixed width — a 80px clamp clipped the label ("Browse...") once
+        # QSS padding + user font scale outgrew it. Size to content instead.
         btn.clicked.connect(self._browse)
         layout.addWidget(btn)
 

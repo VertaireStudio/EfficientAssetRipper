@@ -35,6 +35,10 @@ class StubQProcess(QObject):
         self._err = bytearray()
         self._state = QProcess.ProcessState.Running
         self.write_log: list[bytes] = []
+        # Escalation counters: a wedged CLI ignores SIGTERM, so terminate()
+        # deliberately leaves the state Running — only kill() ends it.
+        self.terminate_calls = 0
+        self.kill_calls = 0
 
     def state(self):
         return self._state
@@ -51,7 +55,11 @@ class StubQProcess(QObject):
     def waitForFinished(self, _ms):
         return True
 
+    def terminate(self):
+        self.terminate_calls += 1
+
     def kill(self):
+        self.kill_calls += 1
         self._state = QProcess.ProcessState.NotRunning
 
     def write(self, data: bytes) -> int:
@@ -91,6 +99,7 @@ def unpacker_with_stub(qtbot):
     proc = StubQProcess(up)
     proc.readyReadStandardOutput.connect(up._on_stdout)
     proc.readyReadStandardError.connect(up._on_stderr)
+    proc.errorOccurred.connect(up._on_error)  # matching UnpackerProcess.start
     up._proc = proc
     return up, proc
 
@@ -821,3 +830,113 @@ def test_missing_cli_reports_error(qtbot, monkeypatch, tmp_path):
     up.error.connect(errors.append)
     assert up.start(str(tmp_path / "nope")) is False
     assert errors and "not found" in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Cancel: immediate shutdown (no wait-for-response)
+# ---------------------------------------------------------------------------
+
+def _sent_cmds(proc):
+    """Decode every line written to stdin into command names."""
+    return [json.loads(bytes(line).decode("utf-8"))["cmd"]
+            for line in proc.write_log]
+
+
+def test_cancel_during_export_terminates_immediately(unpacker_with_stub):
+    """An in-flight export is torn down on the spot: terminate() fires in
+    the cancel call itself, with no graceful token sent and no wait for
+    the CLI to acknowledge."""
+    up, proc = unpacker_with_stub
+    up._cancel_kill_delay_ms = 50  # keep the kill bound fast in tests
+
+    up._send({"cmd": "export"})
+    assert up._outstanding_exports == 1
+    up.cancel()
+
+    # Immediate, not "on the next timer tick".
+    assert proc.terminate_calls == 1
+    assert up._outstanding_exports == 0
+    assert up.cancel_shutdown_requested is True
+    # No graceful cancel token at all — the CLI is being shut down, not
+    # negotiated with.
+    assert "cancel" not in _sent_cmds(proc)
+
+
+def test_wedged_cli_killed_after_terminate_bound(unpacker_with_stub, qtbot):
+    """A CLI that ignores SIGTERM (wedged export thread) is kill()ed after
+    the short bound; the bound is also disarmed if the process dies on its
+    own before it fires."""
+    up, proc = unpacker_with_stub
+    up._cancel_kill_delay_ms = 50
+    up._send({"cmd": "export"})
+    up.cancel()
+
+    # Stub terminate() deliberately leaves the state Running (wedged CLI).
+    qtbot.waitUntil(lambda: proc.kill_calls == 1, timeout=3000)
+    assert proc.state() == QProcess.ProcessState.NotRunning
+
+
+def test_graceful_cli_exit_disarms_cancel_kill_timer(unpacker_with_stub, qtbot):
+    """If the CLI exits after the terminate (before the kill bound fires),
+    the kill timer is disarmed and no hard kill happens."""
+    up, proc = unpacker_with_stub
+    up._cancel_kill_delay_ms = 60_000  # bound never fires in this test
+    up._send({"cmd": "export"})
+    up.cancel()
+    assert up._cancel_timer is not None
+
+    # Simulate the CLI exiting cleanly after the SIGTERM.
+    proc._state = QProcess.ProcessState.NotRunning
+    up._on_finished(0, QProcess.ExitStatus.NormalExit)
+
+    qtbot.waitUntil(lambda: up._cancel_timer is None, timeout=2000)
+    assert proc.kill_calls == 0
+
+
+def test_idle_cancel_sends_graceful_token(unpacker_with_stub):
+    """Cancelling with no export leg in flight must not tear the session
+    down — it sends the graceful token the CLI honors at its boundary."""
+    up, proc = unpacker_with_stub
+    up.cancel()
+    assert up._outstanding_exports == 0
+    assert up._cancel_timer is None
+    assert _sent_cmds(proc) == ["cancel"]
+    assert proc.terminate_calls == 0
+
+
+def test_idle_cancelled_ack_clears_stale_shipping_count(unpacker_with_stub):
+    """An ack without an exporting field (idle cancel) zeroes the count so
+    no later cancel decision ever runs against a stale leg count."""
+    up, proc = unpacker_with_stub
+    up._send({"cmd": "export"})
+    up._on_export_report()          # leg finished before the cancel lands
+    assert up._outstanding_exports == 0
+
+    up.cancel()
+    proc.feed(json.dumps({"type": "cancelled"}))
+    assert up._outstanding_exports == 0
+    assert up._cancel_timer is None
+
+
+def test_process_error_after_cancel_shutdown_is_suppressed(unpacker_with_stub):
+    """The cancel teardown's own kill reports ProcessError.Crashed — that is
+    expected and must not surface as a 'CUE4ParseCLI process error'."""
+    up, proc = unpacker_with_stub
+    up._cancel_kill_delay_ms = 50
+    errors = []
+    up.error.connect(errors.append)
+
+    up._send({"cmd": "export"})
+    up.cancel()
+    assert up.cancel_shutdown_requested is True
+    proc.errorOccurred.emit(QProcess.ProcessError.Crashed)
+    assert errors == []
+
+
+def test_process_error_without_cancel_still_reported(unpacker_with_stub):
+    """A genuine crash (no user cancel in progress) keeps erroring."""
+    up = unpacker_with_stub[0]
+    errors = []
+    up.error.connect(errors.append)
+    up._on_error(QProcess.ProcessError.Crashed)
+    assert errors and "process error" in errors[0]

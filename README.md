@@ -385,7 +385,7 @@ EfficientAssetRipper/
 │   ├── color_schemes.py     # Built-in + custom color scheme registry
 │   ├── log_viewer.py        # Color-coded log display
 │   ├── profile_dialog.py    # Manage Profiles editor (single source of truth for AES keys)
-│   ├── psk_picker.py        # PSK file browser with Everything search
+│   ├── mesh_picker.py       # Mesh file browser (PSK/GLB/FBX) with Everything search
 │   ├── queue_panel.py       # Processing queue table
 │   ├── settings_panel.py    # Configuration dialog (paths, processing, appearance)
 │   ├── splash.py            # Animated startup overlay

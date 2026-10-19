@@ -1,8 +1,10 @@
 """Embedded 3D mesh preview tab.
 
-Loads `.psk` / `.pskx` files via `core.psk_reader` and renders them in a
-`QOpenGLWidget` with an orbit camera. Three render modes are exposed in the
-toolbar: flat-lit color, UV checker grid, and wireframe.
+PSK/PSKX files parse directly via ``core.psk_reader`` and render in a
+``QOpenGLWidget`` with an orbit camera. glTF (.glb/.gltf) and FBX files are
+converted through a headless ``blender/preview_convert.py`` run into plain
+numpy geometry arrays the same viewer can upload. Three render modes are
+exposed in the toolbar: flat-lit color, UV checker grid, and wireframe.
 """
 
 from __future__ import annotations
@@ -10,13 +12,14 @@ from __future__ import annotations
 import atexit
 import logging
 import math
+import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QObject, QPoint, QRunnable, QThreadPool, Signal
+from PySide6.QtCore import Qt, QObject, QPoint, QRunnable, QThreadPool, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QMouseEvent, QPainter, QSurfaceFormat, QWheelEvent
 from PySide6.QtOpenGL import (
     QOpenGLBuffer,
@@ -38,7 +41,8 @@ from PySide6.QtWidgets import (
 )
 
 import gui.theme as theme
-from core.psk_reader import PskMesh, PskParseError, read_psk
+from core.blender_runner import run_blender, PREVIEW_SCRIPT
+from core.psk_reader import PskMesh, PskParseError, _compute_bounds, read_psk
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +81,123 @@ class _LoadRunnable(QRunnable):
             self._signals.failed.emit(self._token, name, str(e))
             return
         self._signals.loaded.emit(self._token, mesh, name)
+
+
+# ---------------------------------------------------------------------------
+# GLB / FBX preview conversion (headless Blender → .npz geometry arrays)
+# ---------------------------------------------------------------------------
+
+class _PreviewConvertWorker(QThread):
+    """Runs headless Blender to convert a GLB/GLTF/FBX file into an .npz
+    geometry dump the in-app viewer can render without another parser.
+
+    The subprocess is driven by ``core.blender_runner.run_blender`` — the
+    same runner the process/FBX pipelines use — so cancel support, timeouts
+    and status parsing behave identically.
+    """
+
+    loaded = Signal(int, str)       # token, npz path
+    failed = Signal(int, str, str)  # token, name, error
+
+    def __init__(self, token: int, src_path: str, out_path: str,
+                 blender_exe: str, timeout: int, parent=None):
+        super().__init__(parent)
+        self._token = token
+        self._src = src_path
+        self._out = out_path
+        self._blender_exe = blender_exe
+        self._timeout = timeout
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _safe_unlink(self):
+        try:
+            os.unlink(self._out)
+        except OSError:
+            pass
+
+    def run(self):
+        name = Path(self._src).name
+        # mode: "preview_arrays" routes run_blender's manifest validation to
+        # the .npz geometry-preview allowlist instead of the standard
+        # .blend/.fbx process-asset rules.
+        manifest = {
+            "mode": "preview_arrays",
+            "psk_path": self._src,
+            "output_path": self._out,
+        }
+        try:
+            result = run_blender(
+                blender_exe=self._blender_exe,
+                manifest=manifest,
+                timeout=self._timeout,
+                cancel_check=lambda: self._cancelled,
+                script=PREVIEW_SCRIPT,
+            )
+        except Exception as e:  # noqa: BLE001 — the worker must never die silently
+            log.exception("Preview conversion crashed for %s", self._src)
+            self._safe_unlink()
+            self.failed.emit(self._token, name, f"Unexpected error: {e}")
+            return
+        try:
+            if not result.success:
+                self._safe_unlink()
+                self.failed.emit(
+                    self._token, name,
+                    result.error_message or "unknown error",
+                )
+                return
+            if not os.path.isfile(self._out) or os.path.getsize(self._out) <= 0:
+                self.failed.emit(
+                    self._token, name, "Converter produced no geometry file"
+                )
+                return
+            self.loaded.emit(self._token, self._out)
+        except Exception as e:  # noqa: BLE001
+            self._safe_unlink()
+            self.failed.emit(self._token, name, str(e))
+
+
+def _psk_mesh_from_npz(path: str | Path) -> PskMesh:
+    """Load a preview-format .npz (verts/normals/uv0/faces) into a PskMesh.
+
+    Raises on absent keys, shape mismatches, or truncated files so the
+    caller can surface a clear failure and delete the file.
+
+    The arrays (written by ``blender/preview_convert.py``) are unique-vertex
+    indexed, which is exactly the wedge layout ``PskMesh`` expects.
+    """
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as data:
+        verts = np.ascontiguousarray(data["verts"], dtype=np.float32)
+        normals = np.ascontiguousarray(data["normals"], dtype=np.float32)
+        uv0 = np.ascontiguousarray(data["uv0"], dtype=np.float32)
+        faces = np.ascontiguousarray(data["faces"], dtype=np.uint32)
+
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        raise ValueError(f"verts has bad shape {verts.shape}")
+    if normals.shape != verts.shape:
+        raise ValueError(f"normals has bad shape {normals.shape}")
+    if uv0.shape != (verts.shape[0], 2):
+        raise ValueError(f"uv0 has bad shape {uv0.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"faces has bad shape {faces.shape}")
+    if faces.size and int(faces.max()) >= verts.shape[0]:
+        raise ValueError("faces reference vertices beyond the vertex array")
+
+    bmin, bmax, center, radius = _compute_bounds(verts)
+    return PskMesh(
+        verts=verts,
+        normals=normals,
+        uv0=uv0,
+        faces=faces,
+        bounds_min=bmin,
+        bounds_max=bmax,
+        center=center,
+        radius=radius,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +821,11 @@ class MeshPreviewerPanel(QWidget):
         self._load_signals.loaded.connect(self._on_load_done)
         self._load_signals.failed.connect(self._on_load_failed)
 
+        # Active GLB/FBX→npz conversion. Reaped like the picker's search
+        # worker: a running worker is cleaned up by its own signals, an idle
+        # one by deleteLater at next start.
+        self._convert_worker: _PreviewConvertWorker | None = None
+
         # Temp dir for temp-export-for-preview from the unpacker. Mirrors the
         # AudioPreviewerPanel pattern — gives the unpacker a place to drop
         # preview-only PSKs that never pollute the user's real export folder.
@@ -744,7 +870,8 @@ class MeshPreviewerPanel(QWidget):
 
         self._placeholder = QLabel(
             "Right-click a mesh row in the Asset Browser → Preview Mesh\n"
-            "(or right-click an exported .uasset in the Unpacker)"
+            "(or right-click an exported .uasset in the Unpacker)\n\n"
+            "PSK/PSKX parse directly; GLB/GLTF/FBX convert via Blender"
         )
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setWordWrap(True)
@@ -778,8 +905,12 @@ class MeshPreviewerPanel(QWidget):
         """Temp directory the unpacker can write preview-only PSKs into."""
         return self._temp_dir
 
-    def load_psk(self, path: str | Path):
-        """Parse and display a PSK / PSKX file. Heavy work runs on a thread."""
+    def load_mesh(self, path: str | Path):
+        """Parse and display a mesh file. Heavy work runs off the GUI thread.
+
+        PSK/PSKX parse directly in-process. GLB/GLTF/FBX go through a
+        headless Blender conversion into geometry arrays first.
+        """
         path_str = str(path)
         self._current_path = path_str
         name = Path(path_str).name
@@ -791,6 +922,21 @@ class MeshPreviewerPanel(QWidget):
             self._placeholder.setText(f"File not found:\n{path_str}")
             return
 
+        suffix = Path(path_str).suffix.lower()
+        if suffix in (".glb", ".gltf", ".fbx"):
+            self._start_conversion(path_str)
+            return
+
+        if suffix not in (".psk", ".pskx"):
+            self._status_name.setText(f"Unsupported: {name}")
+            self._status_stats.setText("")
+            self._stack.setCurrentWidget(self._placeholder)
+            self._placeholder.setText(
+                f"Unsupported mesh format:\n{path_str}\n\n"
+                "Supported: .psk, .pskx, .glb, .gltf, .fbx"
+            )
+            return
+
         self._load_token += 1
         token = self._load_token
         self._status_name.setText(f"Loading: {name}…")
@@ -798,6 +944,123 @@ class MeshPreviewerPanel(QWidget):
 
         runnable = _LoadRunnable(token, path_str, self._load_signals)
         QThreadPool.globalInstance().start(runnable)
+
+    def load_psk(self, path: str | Path):
+        """Backward-compatible alias for :meth:`load_mesh`."""
+        self.load_mesh(path)
+
+    # ------------------------------------------------------------------
+    # GLB / FBX conversion plumbing
+    # ------------------------------------------------------------------
+
+    def _start_conversion(self, src_path: str):
+        """Convert a GLB/GLTF/FBX file via headless Blender for preview."""
+        import config as _config  # local import — keep Qt-free at module load
+
+        name = Path(src_path).name
+        blender_exe = _config.get("blender_exe")
+        if not blender_exe:
+            self._status_name.setText("Blender not configured")
+            self._status_stats.setText("")
+            self._stack.setCurrentWidget(self._placeholder)
+            self._placeholder.setText(
+                f"Previewing {name} requires Blender.\n\n"
+                "Set the Blender executable path in Settings."
+            )
+            self.log_message.emit(
+                "Mesh preview needs a Blender executable (Settings) to "
+                f"convert {name}", "warning",
+            )
+            return
+
+        self._load_token += 1
+        token = self._load_token
+
+        out_path = self._temp_dir / f"preview_{token}_{Path(name).stem}.npz"
+        try:
+            if out_path.exists():
+                os.unlink(out_path)
+        except OSError:
+            pass
+
+        self._status_name.setText(f"Converting: {name}…")
+        self._status_stats.setText("")
+        self._stack.setCurrentWidget(self._placeholder)
+        self._placeholder.setText(
+            f"Converting {name} via Blender…\n\n"
+            "The first conversion starts slower (Blender startup)."
+        )
+
+        # Reap the previous worker so repeated previews don't accumulate
+        # QThread instances parented to this panel (leak).
+        old = self._convert_worker
+        self._convert_worker = None
+        if old is not None:
+            try:
+                running = old.isRunning()
+            except RuntimeError:
+                # Its queued deleteLater already ran — the C++ object is
+                # gone and the Python wrapper is just a husk.
+                running = False
+            if running:
+                old.loaded.connect(old.deleteLater)
+                old.failed.connect(old.deleteLater)
+            else:
+                try:
+                    old.deleteLater()
+                except RuntimeError:
+                    pass  # already destroyed
+
+        try:
+            timeout = int(_config.get_int("timeout_seconds") or 120)
+        except Exception:  # noqa: BLE001 — config read is best-effort
+            timeout = 120
+
+        self._convert_worker = _PreviewConvertWorker(
+            token, src_path, str(out_path), blender_exe, timeout, self
+        )
+        self._convert_worker.loaded.connect(self._on_convert_done)
+        self._convert_worker.failed.connect(self._on_convert_failed)
+        self._convert_worker.loaded.connect(self._convert_worker.deleteLater)
+        self._convert_worker.failed.connect(self._convert_worker.deleteLater)
+        self._convert_worker.start()
+
+    def _on_convert_done(self, token: int, npz_path: str):
+        """Build a PskMesh from the converter's .npz output."""
+        self._convert_worker = None
+        if token != self._load_token:
+            return
+        name = Path(self._current_path).name
+        try:
+            mesh = _psk_mesh_from_npz(npz_path)
+        except Exception as e:  # noqa: BLE001 — surface any array corruption
+            log.warning("Preview npz load failed for %s: %s", npz_path, e)
+            self._delete_temp_file(npz_path)
+            self._on_convert_failed(token, name, f"conversion output invalid: {e}")
+            return
+        # Delete the geometry dump once it's in memory — the temp dir holds
+        # one file per preview attempt, and stale previews would accumulate.
+        self._delete_temp_file(npz_path)
+        self._gl.set_mesh(mesh)
+        self._stack.setCurrentWidget(self._gl)
+        self._status_name.setText(name)
+
+    def _on_convert_failed(self, token: int, name: str, error: str):
+        self._convert_worker = None
+        if token != self._load_token:
+            return
+        self._status_name.setText(f"Failed: {name}")
+        self._status_stats.setText("")
+        self._stack.setCurrentWidget(self._placeholder)
+        self._placeholder.setText(f"Failed to preview {name}\n{error}")
+        self.log_message.emit(f"Mesh preview error: {error}", "error")
+
+    @staticmethod
+    def _delete_temp_file(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
     def clear(self):
         self._gl.clear()

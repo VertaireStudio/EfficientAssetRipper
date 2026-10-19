@@ -5,13 +5,21 @@ fast file-name searches across all indexed volumes.
 """
 
 import ctypes
-import ctypes.wintypes as wt
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
 
 from _base import base_dir
+
+# ---------------------------------------------------------------------------
+# Mesh formats the app consumes end-to-end (Everything query list).
+# Keep in sync with the mirrored _MESH_EXTS tuple in core.file_search and
+# the .psk/.pskx-only subset the binary parser reads (asset_scanner.
+# _extract_psk_materials).
+# ---------------------------------------------------------------------------
+MESH_EXTS = ("psk", "pskx", "glb", "fbx")
 
 # ---------------------------------------------------------------------------
 # Everything SDK constants
@@ -97,6 +105,10 @@ def _load_winddll(path: str):
     except TypeError:
         # Python < 3.8 fallback (winmode unsupported); we still required abs path.
         return ctypes.WinDLL(path)
+    except AttributeError:
+        # ctypes.WinDLL does not exist on POSIX. Belt-and-braces: callers treat
+        # this like any other load failure instead of crashing on it.
+        raise OSError(f"ctypes.WinDLL is unavailable on this platform: {path!r}")
 
 
 class EverythingSDK:
@@ -268,11 +280,34 @@ class EverythingSDK:
 
     # ------------------------------------------------------------------
     def find_psk_files(self, folder: str = "") -> list[Path]:
-        """Find all .psk and .pskx files, optionally scoped to a folder."""
+        """Find all .psk and .pskx files, optionally scoped to a folder.
+
+        PSK-only subset of :meth:`find_mesh_files`. Kept for callers that
+        specifically need PSK binary assets (e.g. the Everything smoke test);
+        the Mesh Picker and AssetScanner resolve all mesh formats together
+        via ``find_mesh_files``.
+        """
         parts: list[str] = []
         if folder:
             parts.append(f'path:"{_normalize_folder(folder)}"')
         parts.append("ext:psk;pskx")
+        query = " ".join(parts)
+        raw = self.search(query, max_results=100_000)
+        return [Path(p) for p in raw]
+
+    # ------------------------------------------------------------------
+    def find_mesh_files(self, folder: str = "") -> list[Path]:
+        """Find every supported mesh file, optionally scoped to a folder.
+
+        Mirrors the app's mesh export pipeline: PSK/PSKX straight from
+        CUE4Parse, .glb from the "glb" mesh-format setting, .fbx from the
+        Blender conversion worker.
+        """
+        parts: list[str] = []
+        if folder:
+            parts.append(f'path:"{_normalize_folder(folder)}"')
+        # ext: takes a semicolon-delimited OR-list (voidtools Search Syntax).
+        parts.append("ext:" + ";".join(MESH_EXTS))
         query = " ".join(parts)
         raw = self.search(query, max_results=100_000)
         return [Path(p) for p in raw]
@@ -358,10 +393,24 @@ def get_sdk(dll_path: Optional[str] = None):
 def _build_backend(dll_path: Optional[str]):
     """Build EverythingSDK if possible, else WalkSearcher."""
     from core.file_search import WalkSearcher
+    log = __import__("logging").getLogger(__name__)
+
+    # Everything uses WM_COPYDATA IPC + NTFS-only indexing — Windows only.
+    # ctypes.WinDLL doesn't even exist on POSIX, and an AttributeError escaping
+    # this guard would bypass the intended fallback (it is neither OSError nor
+    # EverythingError). Guard explicitly so non-Windows cleanly routes to the
+    # alternative backends below.
+    if sys.platform != "win32":
+        log.info(
+            "Non-Windows platform (%s) — Everything SDK unavailable, "
+            "trying alternative search backends",
+            sys.platform,
+        )
+        return _build_posix_backend(log)
+
     try:
         sdk = EverythingSDK(dll_path)
     except EverythingError as e:
-        log = __import__("logging").getLogger(__name__)
         log.warning(
             "Everything SDK unavailable (%s) — falling back to built-in walker", e
         )
@@ -381,6 +430,26 @@ def _build_backend(dll_path: Optional[str]):
     return sdk
 
 
+def _build_posix_backend(log):
+    """Best-effort non-Windows backend: plocate if available, else os.walk."""
+    from core.file_search import PlocateSearcher, WalkSearcher
+    try:
+        searcher = PlocateSearcher()
+        ok, msg = searcher.test_connection()
+    except Exception as e:  # noqa: BLE001 — backend probe must never crash the app
+        log.warning(
+            "plocate backend probe failed (%s) — falling back to built-in walker", e
+        )
+        return WalkSearcher()
+    if ok:
+        log.info("Using plocate search backend (%s)", msg)
+        return searcher
+    log.warning(
+        "plocate backend unavailable (%s) — falling back to built-in walker", msg,
+    )
+    return WalkSearcher()
+
+
 def reset_sdk():
     global _instance
     with _instance_lock:
@@ -397,10 +466,17 @@ def reset_sdk():
         handle = getattr(dll, "_handle", None)
         if handle:
             import _ctypes  # type: ignore[attr-defined]
-            try:
-                _ctypes.FreeLibrary(handle)
-            except Exception:  # noqa: BLE001 — best-effort
-                pass
+            # FreeLibrary exists only on Windows; POSIX uses dlclose. Neither
+            # exists on the "other" platform, so pick by availability to make
+            # sure the handle is actually released instead of silently leaking.
+            free = getattr(_ctypes, "FreeLibrary", None) or getattr(
+                _ctypes, "dlclose", None
+            )
+            if free is not None:
+                try:
+                    free(handle)
+                except Exception:  # noqa: BLE001 — best-effort unload
+                    pass
     except Exception:  # noqa: BLE001
         pass
     finally:

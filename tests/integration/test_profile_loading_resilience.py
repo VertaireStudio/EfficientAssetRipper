@@ -106,6 +106,53 @@ def test_repeat_corruption_does_not_clobber_first_backup(tmp_profiles_dir, monke
 
 
 # ---------------------------------------------------------------------------
+# mesh_processed rename migration
+# ---------------------------------------------------------------------------
+
+def test_legacy_psk_processed_migrates_to_mesh_processed(tmp_profiles_dir):
+    """Profiles written before the Mesh Picker rename still restore history."""
+    legacy = json.dumps({
+        "name": "Legacy",
+        "game_dir": "X:\\Foo",
+        "psk_processed": ["F:/out/A.psk", "F:/out/B.glb"],
+    })
+    _write_raw(tmp_profiles_dir, "Legacy", legacy)
+
+    pm = ProfileManager()
+    loaded = pm.load_profile("Legacy")
+    assert loaded["mesh_processed"] == ["F:/out/A.psk", "F:/out/B.glb"]
+    assert "psk_processed" not in loaded
+
+
+def test_psk_and_mesh_processed_union_merge(tmp_profiles_dir):
+    """Both keys present → mesh_processed wins, legacy paths merged in."""
+    raw = json.dumps({
+        "name": "Mixed",
+        "mesh_processed": ["F:/out/A.psk"],
+        "psk_processed": ["F:/out/A.psk", "F:/out/C.fbx"],
+    })
+    _write_raw(tmp_profiles_dir, "Mixed", raw)
+
+    pm = ProfileManager()
+    loaded = pm.load_profile("Mixed")
+    assert loaded["mesh_processed"] == ["F:/out/A.psk", "F:/out/C.fbx"]
+
+
+def test_corrupt_processed_values_reset_to_list(tmp_profiles_dir):
+    raw = json.dumps({
+        "name": "Corrupt",
+        "mesh_processed": "not-a-list",
+        "psk_processed": 42,
+    })
+    _write_raw(tmp_profiles_dir, "Corrupt", raw)
+
+    pm = ProfileManager()
+    loaded = pm.load_profile("Corrupt")
+    # mesh_processed reset to []; the legacy key (non-list) is discarded.
+    assert loaded["mesh_processed"] == []
+
+
+# ---------------------------------------------------------------------------
 # OS-level errors propagate as ProfileLoadError
 # ---------------------------------------------------------------------------
 
@@ -162,7 +209,6 @@ def test_missing_keys_are_filled_with_defaults(tmp_profiles_dir):
     # Defaults filled in
     assert loaded["ue_version"] == "GAME_UE5_4"
     assert loaded["aes_keys"] == []
-    assert loaded["custom_schemes"] == {}
     assert loaded["auto_save_paths"] is False
 
 

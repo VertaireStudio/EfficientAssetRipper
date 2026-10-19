@@ -180,3 +180,69 @@ def test_scan_cancellation_breaks_loop(tmp_path, tiny_presets):
     results = scanner.scan(progress_callback=cb)
     # Cancellation should stop early; we shouldn't have all 5 resolved
     assert len(results) < 5
+
+
+def test_scan_uses_find_mesh_files_backend(tmp_path, tiny_presets):
+    """The scanner queries all mesh formats together, not just PSK."""
+    mesh = tmp_path / "SK_Mix.glb"
+    mesh.write_bytes(b"\x00" * 32)
+    sdk = FakeEverythingSDK(psk_files=[mesh], props_files={})
+    scanner = AssetScanner(str(tmp_path), tiny_presets, sdk=sdk)
+    scanner.scan()
+    backend_calls = [c[0] for c in sdk.calls if "mesh" in c[0] or "psk" in c[0]]
+    assert "find_mesh_files" in backend_calls
+    assert "find_psk_files" not in backend_calls
+
+
+def test_scan_resolves_glb_with_material_props(tmp_path, tiny_presets):
+    """A .glb asset resolves through the same props-based material chain."""
+    glb = tmp_path / "Game" / "Prop" / "SM_Crate.glb"
+    glb.parent.mkdir(parents=True)
+    glb.write_bytes(b"\x00" * 32)
+
+    mesh_props = _write_mesh_props_for(tmp_path, "SM_Crate", "MI_Crate_Wood")
+    mat_props = _write_material_props(tmp_path, "MI_Crate_Wood", "T_Crate_C")
+    tex_path = tmp_path / "Game" / "Prop" / "Textures" / "T_Crate_C.tga"
+    tex_path.parent.mkdir(parents=True)
+    tex_path.write_bytes(b"\x00")
+
+    sdk = FakeEverythingSDK(
+        psk_files=[glb],
+        props_files={
+            "SM_Crate": [mesh_props],
+            "MI_Crate_Wood": [mat_props],
+        },
+        textures={"T_Crate_C": [tex_path]},
+    )
+    scanner = AssetScanner(str(tmp_path / "Game"), tiny_presets, sdk=sdk)
+    results = scanner.scan()
+    assert len(results) == 1
+    a = results[0]
+    assert a.name == "SM_Crate"
+    assert a.mesh_props_found is True
+    assert a.materials[0].material_name == "MI_Crate_Wood"
+    assert a.status == "ready"
+
+
+def test_scan_glb_without_materials_is_no_materials_not_scan_failed(
+    tmp_path, tiny_presets
+):
+    """GLB has no PSK chunks — the binary fallback must be skipped so an
+    empty props material list surfaces as no_materials, not scan_failed."""
+    glb = tmp_path / "SM_Bare.glb"
+    glb.write_bytes(b"\x00" * 32)
+    bare = tmp_path / "SM_Bare.props.txt"
+    bare.write_text("{ \"Properties\": {} }", encoding="utf-8")
+
+    sdk = FakeEverythingSDK(
+        psk_files=[glb],
+        props_files={"SM_Bare": [bare]},
+    )
+    scanner = AssetScanner(str(tmp_path), tiny_presets, sdk=sdk)
+    results = scanner.scan()
+    assert len(results) == 1
+    a = results[0]
+    # Props were found and parsed; the material list is simply empty.
+    assert a.mesh_props_found is True
+    assert a.materials == []
+    assert a.status == "no_materials"

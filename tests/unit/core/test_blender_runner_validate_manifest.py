@@ -38,16 +38,24 @@ def test_rejects_missing_output_path(tmp_path):
         _validate_manifest(m)
 
 
-def test_rejects_non_psk_extension(tmp_path):
+def test_rejects_non_mesh_extension(tmp_path):
     m = _ok_manifest(tmp_path)
-    m["psk_path"] = "C:/games/foo/Mesh.fbx"
-    with pytest.raises(ManifestValidationError, match=r"\.psk"):
+    m["psk_path"] = "C:/games/foo/Mesh.uasset"
+    with pytest.raises(ManifestValidationError):
         _validate_manifest(m)
 
 
 def test_accepts_pskx_extension(tmp_path):
     m = _ok_manifest(tmp_path)
     m["psk_path"] = "C:/games/foo/Mesh.pskx"
+    _validate_manifest(m)
+
+
+@pytest.mark.parametrize("ext", ["glb", "gltf", "fbx"])
+def test_accepts_blender_native_mesh_inputs(tmp_path, ext):
+    """Mesh Picker feeds GLB/GLTF/FBX exports through the same pipeline."""
+    m = _ok_manifest(tmp_path)
+    m["psk_path"] = f"C:/games/foo/Mesh.{ext}"
     _validate_manifest(m)
 
 
@@ -148,3 +156,62 @@ def test_rejects_non_dict_materials(tmp_path):
     m["materials"] = []
     with pytest.raises(ManifestValidationError, match="materials"):
         _validate_manifest(m)
+
+
+# ---------------------------------------------------------------------------
+# mode: "preview_arrays" (GLB/FBX → npz geometry for the in-app previewer)
+# ---------------------------------------------------------------------------
+
+def _preview_manifest(tmp_path, src_name="in.glb"):
+    src = tmp_path / src_name
+    src.write_bytes(b"\x00")
+    return {
+        "mode": "preview_arrays",
+        "psk_path": str(src),
+        "output_path": str(tmp_path / "out.npz"),
+    }
+
+
+def test_preview_mode_validates_glb_to_npz(tmp_path):
+    _validate_manifest(_preview_manifest(tmp_path))
+
+
+def test_preview_mode_rejects_psk_input(tmp_path):
+    m = _preview_manifest(tmp_path, "in.psk")
+    with pytest.raises(ManifestValidationError, match="preview input"):
+        _validate_manifest(m)
+
+
+def test_preview_mode_rejects_bad_output_extension(tmp_path):
+    m = _preview_manifest(tmp_path)
+    m["output_path"] = str(tmp_path / "out.blend")
+    with pytest.raises(ManifestValidationError, match=r"\.npz"):
+        _validate_manifest(m)
+
+
+def test_preview_mode_requires_existing_source(tmp_path):
+    m = _preview_manifest(tmp_path)
+    os.unlink(m["psk_path"])
+    with pytest.raises(ManifestValidationError, match="does not exist"):
+        _validate_manifest(m)
+
+
+def test_preview_mode_rejects_relative_output(tmp_path):
+    m = _preview_manifest(tmp_path)
+    m["output_path"] = "out.npz"
+    with pytest.raises(ManifestValidationError, match="absolute"):
+        _validate_manifest(m)
+
+
+def test_preview_mode_respects_outputs_root(tmp_path):
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    m = _preview_manifest(tmp_path)
+    m["outputs_root"] = str(safe)
+    with pytest.raises(ManifestValidationError, match="escapes"):
+        _validate_manifest(m)
+
+
+def test_standard_mode_ignores_mode_dispatch(tmp_path):
+    """Standard manifests (no mode key) still validate as before."""
+    _validate_manifest(_ok_manifest(tmp_path))

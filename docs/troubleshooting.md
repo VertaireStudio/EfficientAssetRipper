@@ -135,7 +135,7 @@ redaction filter (AES keys, hex blobs ≥ 32 chars are masked).
    - **UE Version** — pick from the dropdown, or type the exact
      `EGame` enum value (e.g. `GAME_UE5_3`).
    - **Mounted folder** — where the unpacker writes exported files.
-     Also where the PSK Picker reads from.
+     Also where the Mesh Picker reads from.
    - **Output folder** — where Blender writes `.blend` files.
    - **AES Keys** — one row per GUID/key pair (see above).
 4. Click **OK** to commit.

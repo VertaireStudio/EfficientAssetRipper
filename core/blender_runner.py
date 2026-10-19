@@ -26,6 +26,16 @@ BLENDER_SCRIPT = str(
     base_dir() / "blender" / "process_asset.py"
 )
 
+# Geometry-preview converter for GLB/GLTF/FBX inputs the PSK-only viewer
+# can't parse directly (see blender/preview_convert.py).
+PREVIEW_SCRIPT = str(
+    base_dir() / "blender" / "preview_convert.py"
+)
+
+# Mesh input formats the preview script accepts (GLB/GLTF/FBX only — PSK is
+# parsed in-process by core.psk_reader and never hits Blender for preview).
+_PREVIEW_INPUT_EXTS = frozenset({".glb", ".gltf", ".fbx"})
+
 
 # Image-file extensions that the Blender script will accept.  Mirrored from
 # blender/process_asset.py so we can reject obviously-bogus manifests before
@@ -36,17 +46,76 @@ _IMAGE_EXTS = frozenset({
 })
 
 
+# Mesh input formats the Blender script accepts in the standard
+# ("psk_path" manifest) mode. Mirrored from blender/process_asset.py so we
+# can reject obviously-bogus manifests before even spawning Blender
+# (defence in depth — the script also validates).
+_MESH_INPUT_EXTS = frozenset({".psk", ".pskx", ".glb", ".gltf", ".fbx"})
+
+
 class ManifestValidationError(ValueError):
     """Raised when a manifest fails the pre-spawn allowlist check."""
+
+
+def _validate_preview_arrays_manifest(manifest: dict) -> None:
+    """Allowlist check for ``mode: "preview_arrays"`` manifests.
+
+    Input holds the GLB/GLTF/FBX source in the shared ``psk_path`` key and
+    ``output_path`` must land on a ``.npz`` geometry-array file.
+    """
+    src = manifest.get("psk_path", "")
+    output_path = manifest.get("output_path", "")
+    outputs_root = manifest.get("outputs_root", "")
+
+    if not isinstance(src, str) or not src:
+        raise ManifestValidationError("manifest missing psk_path")
+    if not isinstance(output_path, str) or not output_path:
+        raise ManifestValidationError("manifest missing output_path")
+
+    src_ext = os.path.splitext(src)[1].lower()
+    if src_ext not in _PREVIEW_INPUT_EXTS:
+        raise ManifestValidationError(
+            f"preview input must end in .glb/.gltf/.fbx (got {src_ext!r})"
+        )
+    if not os.path.isfile(src):
+        raise ManifestValidationError(f"psk_path does not exist: {src}")
+
+    if not os.path.isabs(output_path):
+        raise ManifestValidationError(
+            f"output_path must be absolute: {output_path}"
+        )
+    if os.path.splitext(output_path)[1].lower() != ".npz":
+        raise ManifestValidationError(
+            f"output_path must end in .npz: {output_path}"
+        )
+
+    if outputs_root:
+        norm_root = os.path.normpath(outputs_root)
+        norm_out = os.path.normpath(output_path)
+        try:
+            common = os.path.commonpath([norm_out, norm_root])
+        except ValueError:
+            common = ""
+        if common != norm_root:
+            raise ManifestValidationError(
+                f"output_path {output_path!r} escapes outputs_root "
+                f"{outputs_root!r}"
+            )
 
 
 def _validate_manifest(manifest: dict) -> None:
     """Cheap allowlist check on a manifest before we hand it to Blender.
 
-    Mirrors the validation inside ``blender/process_asset.py``.  Any
-    inconsistency is raised as :class:`ManifestValidationError` so the caller
-    can surface a meaningful error instead of waiting for a Blender crash.
+    Dispatches on the optional ``mode`` key; absence means the standard
+    process-asset manifest.  Mirrors the validation inside the Blender
+    scripts.  Any inconsistency is raised as
+    :class:`ManifestValidationError` so the caller can surface a meaningful
+    error instead of waiting for a Blender crash.
     """
+    if manifest.get("mode") == "preview_arrays":
+        _validate_preview_arrays_manifest(manifest)
+        return
+
     psk_path = manifest.get("psk_path", "")
     output_path = manifest.get("output_path", "")
     outputs_root = manifest.get("outputs_root", "")
@@ -57,9 +126,10 @@ def _validate_manifest(manifest: dict) -> None:
         raise ManifestValidationError("manifest missing output_path")
 
     psk_ext = os.path.splitext(psk_path)[1].lower()
-    if psk_ext not in (".psk", ".pskx"):
+    if psk_ext not in _MESH_INPUT_EXTS:
         raise ManifestValidationError(
-            f"psk_path must end in .psk/.pskx (got {psk_ext!r})"
+            "psk_path must end in .psk/.pskx/.glb/.gltf/.fbx "
+            f"(got {psk_ext!r})"
         )
 
     if not os.path.isabs(output_path):
@@ -236,6 +306,7 @@ def run_blender(
     on_status: Optional[Callable[[dict], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     on_proc_started: Optional[Callable[["subprocess.Popen"], None]] = None,
+    script: str = BLENDER_SCRIPT,
 ) -> BlenderResult:
     """Run Blender in background mode to process a single asset.
 
@@ -251,6 +322,9 @@ def run_blender(
         on_proc_started: Optional callback invoked once with the live
             ``subprocess.Popen`` so the caller can hold a reference and call
             ``terminate()``/``kill()`` directly if needed.
+        script: Blender python script to execute. Defaults to the standard
+            process-asset script; the geometry preview converter is passed
+            explicitly.
     """
     asset_name = os.path.basename(manifest.get("psk_path", "unknown"))
     result = BlenderResult(success=False, asset_name=asset_name)
@@ -294,7 +368,7 @@ def run_blender(
             blender_exe,
             "--background",
             "--python",
-            BLENDER_SCRIPT,
+            script,
             "--",
             tmp_path,
             "--nonce",

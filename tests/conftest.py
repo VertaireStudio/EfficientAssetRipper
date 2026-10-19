@@ -213,6 +213,11 @@ class FakeEverythingSDK:
         self._record("find_psk_files", folder=folder)
         return list(self._psk_files)
 
+    def find_mesh_files(self, folder: str = "") -> list[Path]:
+        """Same seeded list as find_psk_files — the fake is format-agnostic."""
+        self._record("find_mesh_files", folder=folder)
+        return list(self._psk_files)
+
     def find_props_file(self, name: str, folder: str = "") -> list[Path]:
         self._record("find_props_file", name, folder=folder)
         return list(self._props_files.get(name.lower(), []))

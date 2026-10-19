@@ -41,6 +41,7 @@ omit = [
     "blender/process_asset.py",
     "blender/material_setup.py",
     "blender/combine_blends.py",
+    "blender/preview_convert.py",
 ]
 
 [tool.coverage.report]

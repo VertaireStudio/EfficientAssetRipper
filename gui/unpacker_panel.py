@@ -281,6 +281,16 @@ class UnpackerPanel(QWidget):
     def is_exporting(self) -> bool:
         return self._exporting
 
+    def mounted_folder(self) -> str:
+        """Current text of the Unpacker tab's ``Mounted Folder`` field.
+
+        This is the folder where exports land (and where the PSK Picker /
+        Asset Browser read from). It can diverge from ``config`` between
+        profile loads and exports because the field only syncs to config at
+        export start — callers that need the *live* value should use this.
+        """
+        return self._output_dir_edit.text().strip()
+
     def load_from_profile(self, profile: dict) -> None:
         """Populate UI fields from a profile dict.
 
@@ -492,7 +502,7 @@ class UnpackerPanel(QWidget):
         self._output_dir_edit.setText(config.get("unpack_output_dir"))
         out_row.addWidget(self._output_dir_edit)
         self._browse_output_btn = QPushButton("Browse...")
-        self._browse_output_btn.setFixedWidth(80)
+        # Content-sized (a fixed 80px clipped the label at larger fonts).
         self._browse_output_btn.clicked.connect(self._browse_output_dir)
         out_row.addWidget(self._browse_output_btn)
         export_layout.addLayout(out_row)
@@ -2649,11 +2659,17 @@ class UnpackerPanel(QWidget):
     @Slot()
     def _on_process_ended(self):
         if self._exporting:
-            # The CLI died (or was killed) mid-export without sending export_done.
-            # Without this note the summary numbers never arrive and the log just
-            # trails off with progress lines — looks like a hang, not an abort.
-            self.log_message.emit(
-                "Export aborted — CLI exited before its export finished", "warning")
+            # The CLI died (or was shut down) mid-export without sending
+            # export_done. Without this note the summary numbers never
+            # arrive and the log just trails off with progress lines —
+            # looks like a hang, not an abort.
+            if self._unpacker.cancel_shutdown_requested:
+                self.log_message.emit(
+                    "Export cancelled — export process shut down", "info")
+            else:
+                self.log_message.emit(
+                    "Export aborted — CLI exited before its export finished",
+                    "warning")
         self._exporting = False
         self._mounted = False
         self._suppress_export_error_popup = False
@@ -2674,6 +2690,16 @@ class UnpackerPanel(QWidget):
         self._fmod_banks = {}
         self._fmod_scan_done = False
         self._pending_fmod_export = None
+
+        if self._unpacker.cancel_shutdown_requested:
+            # The cancel deliberately shut the CLI down. Instead of parking
+            # Export / Export Folder / Cancel behind a manual "re-mount"
+            # step, rebuild the session right away — `_mount_archives()`
+            # starts a fresh CLI, re-inits it with the same profile data,
+            # and `_on_initialized` restores every button + the tree.
+            self.log_message.emit(
+                "Restarting export session after cancel…", "info")
+            self._mount_archives()
 
     def shutdown(self):
         """Stop the CLI process (called on app exit)."""

@@ -141,6 +141,27 @@ class TestExportFailurePopup:
         assert "aborted" in sig.args[0].lower()
         assert panel._exporting is False
 
+    def test_process_ended_after_cancel_shutdown_remounts(self, panel):
+        """A cancel-driven CLI shutdown must bring the Unpacker straight
+        back to a usable state (auto re-mount), not park every button
+        behind a manual re-mount step."""
+        panel._exporting = True
+        panel._unpacker._cancel_shutdown_requested = True
+        calls = []
+        panel._mount_archives = lambda: calls.append(True)
+        panel._on_process_ended()
+        assert calls == [True]
+        assert panel._exporting is False
+
+    def test_process_ended_crash_does_not_remount(self, panel):
+        """A genuine CLI crash keeps the manual re-mount flow — no auto
+        restart for unplanned exits."""
+        panel._exporting = True
+        calls = []
+        panel._mount_archives = lambda: calls.append(True)
+        panel._on_process_ended()
+        assert calls == []
+
     def test_process_ended_idle_no_abort_warning(self, panel):
         panel._exporting = False
         sent = []
