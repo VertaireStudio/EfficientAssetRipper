@@ -18,11 +18,39 @@ BUILD_TEMP="${TMPDIR:-/tmp}/EAR_build"
 
 step() { echo; echo "$1"; }
 
+# Install packages with whatever package manager the host has.
+pkg_install() {
+    if command -v apt-get >/dev/null 2>&1; then
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo" || SUDO=""
+        $SUDO apt-get update -qq && $SUDO apt-get install -y "$@"
+    elif command -v dnf >/dev/null 2>&1; then
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo" || SUDO=""
+        $SUDO dnf install -y "$@"
+    elif command -v yum >/dev/null 2>&1; then
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo" || SUDO=""
+        $SUDO yum install -y "$@"
+    elif command -v pacman >/dev/null 2>&1; then
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo" || SUDO=""
+        $SUDO pacman -Sy --noconfirm "$@"
+    elif command -v zypper >/dev/null 2>&1; then
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo" || SUDO=""
+        $SUDO zypper install -y "$@"
+    elif command -v apk >/dev/null 2>&1; then
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo" || SUDO=""
+        $SUDO apk add "$@"
+    elif command -v brew >/dev/null 2>&1; then
+        brew install "$@"
+    else
+        echo "ERROR: no supported package manager found to auto-install $*"
+        return 1
+    fi
+}
+
 step "===================================================="
 step " EfficientAssetRipper — Build Pipeline (Linux)"
 step "===================================================="
 
-# ── Python selection ─────────────────────────────────────────────────────────
+# ── Python selection (auto-installs when missing) ────────────────────────────
 PY=""
 for candidate in python3 python; do
     if command -v "$candidate" >/dev/null 2>&1; then
@@ -31,31 +59,50 @@ for candidate in python3 python; do
     fi
 done
 if [ -z "$PY" ]; then
-    echo "ERROR: Python not found. Install Python 3.11+ from https://python.org"
+    echo "     Python not found — installing python3..."
+    case "$(cat /etc/os-release 2>/dev/null)" in
+        *ubuntu*|*debian*|*raspbian*) pkg_install python3 python3-venv python3-pip ;;
+        *) pkg_install python3 ;;
+    esac
+    PY="$(command -v python3 || command -v python)" || true
+fi
+if [ -z "$PY" ]; then
+    echo "ERROR: Python not found and could not be auto-installed. Install Python 3.11+ from https://python.org"
     exit 1
 fi
-"$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || {
-    echo "ERROR: Python 3.11+ required, found $($PY --version 2>&1)"
+if ! "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "ERROR: Python 3.11+ required, found $($PY --version 2>&1). Please upgrade manually."
     exit 1
-}
+fi
 
-# Prefer the project venv when present so deps don't leak into the system.
+# pip missing (e.g. Debian without python3-pip).
+if ! "$PY" -m pip --version >/dev/null 2>&1; then
+    echo "     pip not found — installing..."
+    pkg_install python3-pip || pkg_install python-pip || { echo "ERROR: pip could not be auto-installed."; exit 1; }
+    "$PY" -m pip --version >/dev/null 2>&1 || { echo "ERROR: pip unavailable under $PY"; exit 1; }
+fi
+
+# Prefer the project venv; create it when absent so deps don't leak into the system.
 if [ -f "$PROJECT_DIR/venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/venv/bin/activate"
+    PY=python
+else
+    echo "     Creating project venv..."
+    "$PY" -m venv "$PROJECT_DIR/venv" || {
+        echo "     venv creation failed (Debian needs python3-venv) — retrying system install..."
+        pkg_install python3-venv || true
+        "$PY" -m venv "$PROJECT_DIR/venv" || { echo "ERROR: failed to create venv."; exit 1; }
+    }
     # shellcheck disable=SC1091
     source "$PROJECT_DIR/venv/bin/activate"
     PY=python
 fi
 
-# ── Step 0: dependencies ─────────────────────────────────────────────────────
+# ── Step 0: dependencies (installed or updated as needed) ────────────────────
 step "[0/5] Checking dependencies..."
-if ! "$PY" -m pip show pyinstaller >/dev/null 2>&1; then
-    echo "     Installing build/test dependencies from requirements-dev.txt..."
-    "$PY" -m pip install -r "$PROJECT_DIR/requirements-dev.txt"
-fi
-if ! "$PY" -m pip show pillow >/dev/null 2>&1; then
-    echo "     Installing runtime dependencies from requirements.txt..."
-    "$PY" -m pip install -r "$PROJECT_DIR/requirements.txt"
-fi
+echo "     Installing/updating requirements (pip skips what is already satisfied)..."
+"$PY" -m pip install -r "$PROJECT_DIR/requirements.txt" -r "$PROJECT_DIR/requirements-dev.txt"
 
 # ── Step 0b: pre-build tests (same gate as build.bat) ────────────────────────
 step "[0b/5] Running pre-build tests..."
