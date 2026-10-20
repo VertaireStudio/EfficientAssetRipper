@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **NixOS platform support** — first-class NixOS handling across the app:
+  `core/platform_detect.py` (NixOS detection via `/etc/os-release`, nix-ld
+  loader availability, well-known NixOS profile bin dirs) is the single
+  source; Blender/FFmpeg discovery now probes NixOS profile dirs
+  (`/run/current-system/sw/bin`, `~/.nix-profile/bin`, per-user profiles)
+  when the GUI launches without a shell PATH. The CUE4ParseCLI launcher
+  resolves the FHS dynamic-loader problem on stock NixOS in order:
+  nix-ld → plain launch; steam-run → transparent relaunch through the FHS
+  env; neither → an actionable error pointing at
+  `programs.nix-ld.enable = true;`. The setup wizard shows NixOS-specific
+  hints for Blender install and the CLI loader. NixOS packaging via a new
+  `flake.nix` (buildFHSEnv bundle wrapping the GUI source + published CLI).
+
 ## [0.9-VS.3] - 2026-10-19
 
 ### Added

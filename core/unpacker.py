@@ -9,6 +9,8 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal, Slot
 
+from core.tools_detect import cue4parse_cli_name
+
 log = logging.getLogger(__name__)
 
 # A single NDJSON line should never exceed this. The CLI emits per-asset
@@ -92,8 +94,38 @@ class UnpackerProcess(QObject):
             self.error.emit(f"CUE4ParseCLI not found: {cli_path}")
             return False
 
+        # NixOS: the published CLI is a self-contained ELF that expects the
+        # FHS dynamic loader (/lib64/ld-linux-x86-64.so.2), which only exists
+        # when the user enabled nix-ld. Without it, fall back to steam-run
+        # (FHS env), and fail with an actionable hint otherwise.
+        launcher_args: list[str] = []
+        if exe.name == cue4parse_cli_name():
+            try:
+                from core import platform_detect
+                if platform_detect.is_nixos() and not platform_detect.has_nix_ld():
+                    steam_run = platform_detect.steam_run_path()
+                    if steam_run:
+                        log.info("NixOS without nix-ld: launching CUE4ParseCLI via %s", steam_run)
+                        (program, launcher_args) = (steam_run, [str(exe)])
+                    else:
+                        self.error.emit(
+                            "CUE4ParseCLI cannot start on NixOS: enable nix-ld"
+                            " (programs.nix-ld.enable = true; in configuration.nix)"
+                            " or install Steam (provides steam-run), then try again."
+                        )
+                        return False
+                else:
+                    program = str(exe)
+            except Exception:
+                log.exception("platform detection failed")
+                program = str(exe)
+        else:
+            program = str(exe)
+
         self._proc = QProcess(self)
-        self._proc.setProgram(str(exe))
+        self._proc.setProgram(program)
+        if launcher_args:
+            self._proc.setArguments(launcher_args)
         self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         if env_overrides:
             from PySide6.QtCore import QProcessEnvironment

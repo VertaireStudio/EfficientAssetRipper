@@ -46,7 +46,16 @@ def detect_blender() -> tuple[bool, str]:
     path = config.get("blender_exe") or tools_detect.detect_blender()
     if path and Path(path).is_file():
         return True, path
-    location = "PATH" if not os.name == "nt" else "default install locations"
+    if os.name != "nt":
+        from core.platform_detect import is_nixos
+        if is_nixos():
+            return False, (
+                "Blender not found — on NixOS add blender to "
+                "environment.systemPackages (or home-manager) and Re-check"
+            )
+        location = "PATH"
+    else:
+        location = "default install locations"
     return False, f"Blender not found in {location} or common install dirs"
 
 
@@ -65,17 +74,39 @@ def detect_everything() -> tuple[bool, str]:
     return False, "Everything64.dll not found — install Everything desktop"
 
 
+def detect_ffmpeg() -> tuple[bool, str]:
+    """Return (found, detail). Same precedence as the CUE4Parse CLI: its
+    verified cache first, then a system install. Not-found is not fatal —
+    the CLI downloads its pinned build on the first audio export — but the
+    row tells the user that is about to happen."""
+    path = tools_detect.detect_ffmpeg()
+    if path:
+        return True, path
+    return False, (
+        "Not cached yet — CUE4Parse CLI auto-downloads ~90 MB on the first "
+        "MP3/WebM audio export (or install ffmpeg and Re-check)"
+    )
+
+
 def detect_dotnet() -> tuple[bool, str]:
     """Return (found, detail).
 
     The CUE4Parse CLI is shipped self-contained (the .NET runtime is baked
     into the binary), so we first check whether the bundled CLI exists — if
-    so, the user needs nothing else. Only fall back to probing
+    so, the user needs nothing else (ffmpeg for audio export is resolved by
+    the CLI itself). Only fall back to probing
     ``dotnet --version`` when the bundled CLI is missing (which means the
     user is running from source and needs .NET to build it).
     """
     cli_path = tools_detect.bundled_cue4parse_cli()
     if cli_path.is_file():
+        from core.platform_detect import is_nixos, has_nix_ld, steam_run_path
+        if is_nixos() and not has_nix_ld() and not steam_run_path():
+            return True, (
+                "CUE4Parse CLI bundled — BUT on NixOS it needs the nix-ld loader."
+                " Enable programs.nix-ld.enable = true; in configuration.nix"
+                " (or install Steam for steam-run)."
+            )
         return True, "CUE4Parse CLI bundled (no .NET install needed)"
 
     if not shutil.which("dotnet"):
@@ -139,8 +170,9 @@ class _DependencyPage(QWizardPage):
         super().__init__()
         self.setTitle("Dependency check")
         self.setSubTitle(
-            "We need three external tools. Anything missing here can be "
-            "installed and re-detected with the Re-check button."
+            "We need three core tools plus FFmpeg (used for MP3/WebM audio "
+            "export; it self-installs on first use). Anything missing here "
+            "can be installed and re-detected with the Re-check button."
         )
 
         layout = QVBoxLayout(self)
@@ -154,6 +186,7 @@ class _DependencyPage(QWizardPage):
         for key, label, hint_url in (
             ("blender", "Blender 4.0+", "https://www.blender.org/download/"),
             ("everything", everything_label, "https://www.voidtools.com/"),
+            ("ffmpeg", "FFmpeg (MP3/WebM audio export)", "https://ffmpeg.org/download.html"),
             ("dotnet", "CUE4Parse CLI / .NET 10.0", "https://dotnet.microsoft.com/download/dotnet/10.0"),
         ):
             row = QHBoxLayout()
@@ -191,6 +224,7 @@ class _DependencyPage(QWizardPage):
         for key, probe in (
             ("blender", detect_blender),
             ("everything", detect_everything),
+            ("ffmpeg", detect_ffmpeg),
             ("dotnet", detect_dotnet),
         ):
             ok, detail = probe_results[key] = probe()

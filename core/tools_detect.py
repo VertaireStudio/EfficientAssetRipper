@@ -11,6 +11,7 @@ import glob
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from _base import base_dir
@@ -78,6 +79,14 @@ def detect_blender() -> str:
     else:
         candidates = [shutil.which("blender") or ""]
 
+        # NixOS: shutil.which covers a shell session, but the GUI can start
+        # without the user's nix profile dirs on PATH (e.g. from a .desktop
+        # entry); probe the well-known profile bin dirs too.
+        if sys.platform == "linux":
+            from core.platform_detect import is_nixos, find_tool_in_nix_dirs
+            if is_nixos():
+                candidates.append(find_tool_in_nix_dirs("blender"))
+
         candidates += [
             "/usr/bin/blender",
             "/usr/local/bin/blender",
@@ -126,6 +135,40 @@ def detect_everything_dll() -> str:
     for c in candidates:
         if os.path.isfile(c):
             return c
+    return ""
+
+
+def detect_ffmpeg() -> str:
+    """Return a usable ffmpeg binary path, or "".
+
+    Resolution mirrors the CUE4Parse CLI (cue4parse_cli/Program.cs
+    InitFfmpeg): its hash-verified download cache first, then a system
+    ffmpeg on PATH (plus common Windows install locations). An empty
+    result means the CLI auto-downloads its pinned build on the first
+    MP3/WebM audio export.
+    """
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    cache = Path(tempfile.gettempdir()) / "CUE4ParseCLI_ffmpeg"
+    for bin_dir in cache.glob("*/bin"):
+        candidate = bin_dir / exe_name
+        if candidate.is_file():
+            return str(candidate)
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    if sys.platform == "win32":
+        for c in (
+            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+        ):
+            if os.path.isfile(c):
+                return c
+    elif sys.platform == "linux":
+        from core.platform_detect import is_nixos, find_tool_in_nix_dirs
+        if is_nixos():
+            nix = find_tool_in_nix_dirs("ffmpeg")
+            if nix:
+                return nix
     return ""
 
 
