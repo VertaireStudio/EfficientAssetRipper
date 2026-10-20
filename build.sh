@@ -104,6 +104,24 @@ step "[0/5] Checking dependencies..."
 echo "     Installing/updating requirements (pip skips what is already satisfied)..."
 "$PY" -m pip install -r "$PROJECT_DIR/requirements.txt" -r "$PROJECT_DIR/requirements-dev.txt"
 
+# libstdc++ is required by the PySide6/Qt binaries this project uses; a missing
+# or too-old system runtime makes importing PySide6 fail with a GLIBCXX error.
+if ! "$PY" -c "import PySide6.QtCore" >/dev/null 2>&1; then
+    if "$PY" -c "import PySide6.QtCore" 2>&1 | grep -qiE "libstdc\+\+|GLIBCXX|CXXABI"; then
+        echo "     libstdc++ missing or too old — installing..."
+        case "$(cat /etc/os-release 2>/dev/null)" in
+            *ubuntu*|*debian*|*raspbian*|*suse*)          pkg_install libstdc++6 ;;
+            *alpine*)                                     pkg_install libstdc++ ;;
+            *arch*|*manjaro*)                             pkg_install gcc-libs ;;
+            *)                                            pkg_install libstdc++ ;;
+        esac
+        "$PY" -c "import PySide6.QtCore" 2>&1 | grep -qiE "libstdc\+\+|GLIBCXX|CXXABI" && {
+            echo "ERROR: libstdc++ installed but PySide6 still fails to load (system lib may be older than the one Qt needs)."; exit 1;
+        }
+    fi
+    # Import still failing for other reasons — the tests below will surface it.
+fi
+
 # ── Step 0b: pre-build tests (same gate as build.bat) ────────────────────────
 step "[0b/5] Running pre-build tests..."
 cd "$PROJECT_DIR"
